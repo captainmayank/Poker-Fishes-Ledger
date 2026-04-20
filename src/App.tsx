@@ -43,7 +43,7 @@ import LiveSettlement from './views/LiveSettlement';
 import GroupLanding from './views/GroupLanding';
 import PlayerHistoryModal from './components/PlayerHistoryModal';
 import type { LiveUser } from './services/liveApi';
-import { getTenantCode, clearTenantCode } from './lib/tenantCode';
+import { getTenantCode, clearTenantCode, seedDefaultTenantIfNeeded } from './lib/tenantCode';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -122,6 +122,16 @@ export default function App() {
   // hooks -- so the gate is placed right after the initial state read. A
   // full reload is used by the Switch-group handler to avoid hook-order
   // asymmetry between the gated and ungated renders.
+  //
+  // Before consulting the gate, run the one-time OGFISH seeder. This is a
+  // no-op for everyone except existing pre-rollout users on their first
+  // load. It must run synchronously (not inside a useEffect) so that it
+  // can feed `getTenantCode()` on the SAME render and skip the landing
+  // page. See `seedDefaultTenantIfNeeded` for the respect-clearing
+  // semantics.
+  if (typeof window !== 'undefined') {
+    seedDefaultTenantIfNeeded();
+  }
   if (typeof window !== 'undefined' && !getTenantCode()) {
     return <GroupLanding />;
   }
