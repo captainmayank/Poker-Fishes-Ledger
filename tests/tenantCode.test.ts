@@ -44,7 +44,10 @@ import {
   setTenantCode,
   clearTenantCode,
   normalizeTenantCode,
+  seedDefaultTenantIfNeeded,
   TENANT_CODE_KEY,
+  TENANT_SEEDED_KEY,
+  DEFAULT_SEED_TENANT_CODE,
 } from '../src/lib/tenantCode';
 
 describe('tenantCode helpers', () => {
@@ -130,5 +133,87 @@ describe('tenantCode helpers', () => {
     expect(getTenantCode()).toBeNull();
     expect(() => setTenantCode('X1Y2Z3')).not.toThrow();
     expect(() => clearTenantCode()).not.toThrow();
+  });
+});
+
+describe('seedDefaultTenantIfNeeded', () => {
+  function getStorage() {
+    return (globalThis as unknown as { window?: { localStorage: MemoryStorage } }).window!
+      .localStorage;
+  }
+
+  beforeEach(() => {
+    installWindow();
+  });
+
+  afterEach(() => {
+    uninstallWindow();
+    vi.restoreAllMocks();
+  });
+
+  it('seeds OGFISH and sets tenantSeeded on a first visit (no code, no flag)', () => {
+    const seeded = seedDefaultTenantIfNeeded();
+
+    expect(seeded).toBe(DEFAULT_SEED_TENANT_CODE);
+    expect(getTenantCode()).toBe('OGFISH');
+    expect(getStorage().getItem(TENANT_SEEDED_KEY)).toBe('1');
+  });
+
+  it('is a no-op on a returning visit (code=OGFISH, flag=1)', () => {
+    const storage = getStorage();
+    storage.setItem(TENANT_CODE_KEY, 'OGFISH');
+    storage.setItem(TENANT_SEEDED_KEY, '1');
+
+    const seeded = seedDefaultTenantIfNeeded();
+
+    expect(seeded).toBeNull();
+    expect(getTenantCode()).toBe('OGFISH');
+    expect(storage.getItem(TENANT_SEEDED_KEY)).toBe('1');
+  });
+
+  it('is a no-op after the user cleared their code via Switch Group (flag=1, no code)', () => {
+    // Simulate: user was seeded before, then hit "Switch Group" which
+    // cleared the tenant code but left the sentinel behind.
+    const storage = getStorage();
+    storage.setItem(TENANT_SEEDED_KEY, '1');
+
+    const seeded = seedDefaultTenantIfNeeded();
+
+    expect(seeded).toBeNull();
+    expect(getTenantCode()).toBeNull();
+    // Flag must still be there so the next load is also a no-op.
+    expect(storage.getItem(TENANT_SEEDED_KEY)).toBe('1');
+  });
+
+  it('is a no-op when the user is already on a different tenant (code=ACES42, flag=1)', () => {
+    const storage = getStorage();
+    storage.setItem(TENANT_CODE_KEY, 'ACES42');
+    storage.setItem(TENANT_SEEDED_KEY, '1');
+
+    const seeded = seedDefaultTenantIfNeeded();
+
+    expect(seeded).toBeNull();
+    expect(getTenantCode()).toBe('ACES42');
+  });
+
+  it('marks an already-chosen tenant as seeded without overwriting it', () => {
+    // Edge case: landing page ran in a previous session and picked
+    // ACES42 before the seeder shipped. On next load we must not
+    // overwrite their choice, but we should still set the sentinel
+    // so we stay a no-op from here on.
+    const storage = getStorage();
+    storage.setItem(TENANT_CODE_KEY, 'ACES42');
+
+    const seeded = seedDefaultTenantIfNeeded();
+
+    expect(seeded).toBeNull();
+    expect(getTenantCode()).toBe('ACES42');
+    expect(storage.getItem(TENANT_SEEDED_KEY)).toBe('1');
+  });
+
+  it('is a no-op when window is undefined (SSR-safe)', () => {
+    uninstallWindow();
+    expect(() => seedDefaultTenantIfNeeded()).not.toThrow();
+    expect(seedDefaultTenantIfNeeded()).toBeNull();
   });
 });
