@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import {
-  liveApi, LiveUser, LiveSession, LiveSessionPlayer, LiveBuyIn,
+  liveApi, LiveUser, LiveSession, LiveSessionPlayer, LiveBuyIn, LiveAttendanceEvent,
 } from '../services/liveApi';
+import { buildAttendanceIntervals } from '../lib/playPlan';
 import {
   Check, X, Users, Trophy, Plus, DollarSign, AlertTriangle,
-  History, ChevronDown, ChevronUp, Clock, ShieldCheck, LogOut,
+  History, ChevronDown, ChevronUp, Clock, ShieldCheck, RefreshCw, Pause, Play,
 } from 'lucide-react';
 
 interface Props {
@@ -17,13 +18,18 @@ export default function LiveSessionAdmin({ user, sessionCode, navigate }: Props)
   const [session, setSession]   = useState<LiveSession | null>(null);
   const [players, setPlayers]   = useState<LiveSessionPlayer[]>([]);
   const [buyIns, setBuyIns]     = useState<LiveBuyIn[]>([]);
+  const [attendanceEvents, setAttendanceEvents] = useState<LiveAttendanceEvent[]>([]);
+  const [localAttendanceEvents, setLocalAttendanceEvents] = useState<LiveAttendanceEvent[]>([]);
   const [isEnding, setIsEnding] = useState(false);
+  const [isFinalizing, setIsFinalizing] = useState(false);
+  const [endReason, setEndReason] = useState<'completed' | 'table_break' | 'ended_early'>('completed');
   const [isAddingOwn, setIsAddingOwn] = useState(false);
   const [ownAmount, setOwnAmount] = useState('');
   const [finalChipCounts, setFinalChipCounts] = useState<Record<string, string>>({});
   const [expandedPlayer, setExpandedPlayer] = useState<string | null>(null);
   const [error, setError]       = useState('');
   const [fetchError, setFetchError] = useState('');
+  const [now, setNow] = useState(Date.now());
 
   const refreshData = async () => {
     const data = await liveApi.getSession(sessionCode);
@@ -42,6 +48,7 @@ export default function LiveSessionAdmin({ user, sessionCode, navigate }: Props)
     setSession(data.session);
     setPlayers(data.players);
     setBuyIns(data.buyIns);
+    setAttendanceEvents(data.attendanceEvents);
     setFetchError('');
     setFinalChipCounts((prev) => {
       const updated = { ...prev };
@@ -56,27 +63,119 @@ export default function LiveSessionAdmin({ user, sessionCode, navigate }: Props)
 
   useEffect(() => {
     refreshData();
-    const interval = setInterval(refreshData, 3000);
-    return () => clearInterval(interval);
   }, [sessionCode]);
 
+  useEffect(() => {
+    const interval = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    if (!session) return;
+    const key = `live_attendance_journal:${session.id}`;
+    try {
+      const stored = JSON.parse(localStorage.getItem(key) ?? '[]');
+      setLocalAttendanceEvents(
+        Array.isArray(stored)
+          ? stored.filter(
+              (event): event is LiveAttendanceEvent =>
+                event &&
+                typeof event.id === 'string' &&
+                event.sessionId === session.id &&
+                typeof event.userId === 'string' &&
+                (event.eventType === 'pause' || event.eventType === 'resume') &&
+                typeof event.occurredAt === 'number'
+            )
+          : []
+      );
+    } catch {
+      setLocalAttendanceEvents([]);
+    }
+  }, [session?.id]);
+
+  const recordBreakEvent = (
+    player: LiveSessionPlayer,
+    eventType: 'pause' | 'resume'
+  ) => {
+    if (!session || player.leftAt) return;
+    const event: LiveAttendanceEvent = {
+      id: crypto.randomUUID(),
+      sessionId: session.id,
+      userId: player.userId,
+      eventType,
+      occurredAt: Date.now(),
+    };
+    setLocalAttendanceEvents((current) => {
+      const next = [...current, event];
+      localStorage.setItem(
+        `live_attendance_journal:${session.id}`,
+        JSON.stringify(next)
+      );
+      return next;
+    });
+  };
+
+  const isPaused = (userId: string) => {
+    let paused = false;
+    for (const event of [...attendanceEvents, ...localAttendanceEvents]
+      .filter((candidate) => candidate.userId === userId)
+      .sort((a, b) => a.occurredAt - b.occurredAt)) {
+      if (event.eventType === 'pause') paused = true;
+      if (event.eventType === 'leave') paused = false;
+      if (
+        event.eventType === 'join' ||
+        event.eventType === 'rejoin' ||
+        event.eventType === 'resume'
+      ) {
+        paused = false;
+      }
+    }
+    return paused;
+  };
+
+  const activeMinutes = (player: LiveSessionPlayer) =>
+    buildAttendanceIntervals(
+      [...attendanceEvents, ...localAttendanceEvents],
+      player.userId,
+      now,
+      player.joinedAt,
+      player.leftAt
+    ).reduce(
+      (total, interval) => total + (interval.endAt - interval.startAt) / 60_000,
+      0
+    );
+
   const handleApprove = async (id: string) => {
-    await liveApi.updateBuyInStatus(id, 'approved');
-    refreshData();
+    const updated = await liveApi.updateBuyInStatus(id, 'approved', user.authToken);
+    if (updated) {
+      setBuyIns((current) => current.map((buyIn) => (buyIn.id === id ? updated : buyIn)));
+    }
   };
 
   const handleReject = async (id: string) => {
-    await liveApi.updateBuyInStatus(id, 'rejected');
-    refreshData();
+    const updated = await liveApi.updateBuyInStatus(id, 'rejected', user.authToken);
+    if (updated) {
+      setBuyIns((current) => current.map((buyIn) => (buyIn.id === id ? updated : buyIn)));
+    }
   };
 
   const handleAdminBuyIn = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!session || !ownAmount) return;
-    await liveApi.requestBuyIn(session.id, user.id, parseFloat(ownAmount), 'approved');
+    const result = await liveApi.requestBuyIn(
+      session.id,
+      user.id,
+      parseFloat(ownAmount),
+      user.authToken,
+      'approved'
+    );
+    if (!result.success || !result.buyIn) {
+      setError(result.error || 'Failed to add buy-in.');
+      return;
+    }
+    setBuyIns((current) => [...current, result.buyIn!]);
     setOwnAmount('');
     setIsAddingOwn(false);
-    refreshData();
   };
 
   const getPlayerStats = (userId: string) => {
@@ -92,17 +191,32 @@ export default function LiveSessionAdmin({ user, sessionCode, navigate }: Props)
     const pool = buyIns
       .filter((b) => b.status === 'approved')
       .reduce((sum, b) => sum + b.amount, 0);
-    let totalWinnings = 0;
-    for (const p of players) {
-      const val = parseFloat(finalChipCounts[p.userId] ?? String(p.finalWinnings ?? 0));
-      totalWinnings += val;
-      await liveApi.settlePlayer(session.id, p.userId, val);
-    }
+    const results = players.map((player) => ({
+      userId: player.userId,
+      winnings: parseFloat(
+        finalChipCounts[player.userId] ?? String(player.finalWinnings ?? 0)
+      ),
+    }));
+    const totalWinnings = results.reduce((sum, result) => sum + result.winnings, 0);
     if (Math.abs(totalWinnings - pool) > 0.1) {
       setError(`Audit Failed: Chips Out (₹${totalWinnings}) ≠ Pool (₹${pool}).`);
       return;
     }
-    await liveApi.updateSessionStatus(session.id, 'closed');
+    setError('');
+    setIsFinalizing(true);
+    const result = await liveApi.finalizeSession(
+      session.id,
+      results,
+      endReason,
+      localAttendanceEvents,
+      user.authToken
+    );
+    setIsFinalizing(false);
+    if (!result.success) {
+      setError(result.error || 'Failed to finalize session.');
+      return;
+    }
+    localStorage.removeItem(`live_attendance_journal:${session.id}`);
     navigate(`settlement/${session.id}`);
   };
 
@@ -153,6 +267,13 @@ export default function LiveSessionAdmin({ user, sessionCode, navigate }: Props)
             </div>
           </div>
           <div className="flex gap-3">
+            <button
+              onClick={refreshData}
+              title="Load new player requests"
+              className="bg-slate-800 hover:bg-slate-700 text-slate-400 px-4 py-3 rounded-2xl font-black transition-all flex items-center justify-center border border-slate-700"
+            >
+              <RefreshCw className="w-4 h-4" />
+            </button>
             <button
               onClick={() => setIsAddingOwn(!isAddingOwn)}
               className="flex-1 md:flex-none bg-slate-800 hover:bg-emerald-500 text-emerald-400 hover:text-slate-950 px-5 py-3 rounded-2xl font-black transition-all flex items-center justify-center gap-2 border border-slate-700"
@@ -249,6 +370,27 @@ export default function LiveSessionAdmin({ user, sessionCode, navigate }: Props)
               </div>
             ))}
           </div>
+          <div className="space-y-2">
+            <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
+              Why is the table ending?
+            </label>
+            <select
+              value={endReason}
+              onChange={(event) =>
+                setEndReason(
+                  event.target.value as 'completed' | 'table_break' | 'ended_early'
+                )
+              }
+              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-4 text-white font-bold outline-none focus:ring-2 focus:ring-amber-500"
+            >
+              <option value="completed">Planned session completed</option>
+              <option value="table_break">Table broke</option>
+              <option value="ended_early">Host ended the session early</option>
+            </select>
+            <p className="text-[10px] text-slate-500">
+              An early table close shortens every player's plan fairly.
+            </p>
+          </div>
           {error && (
             <div className="p-4 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-400 text-xs font-bold flex items-center gap-3">
               <AlertTriangle className="w-5 h-5 flex-shrink-0" /> {error}
@@ -263,9 +405,10 @@ export default function LiveSessionAdmin({ user, sessionCode, navigate }: Props)
             </button>
             <button
               onClick={finalizeSession}
-              className="flex-1 py-5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-2xl font-black transition-all shadow-2xl shadow-emerald-500/20"
+              disabled={isFinalizing}
+              className="flex-1 py-5 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 rounded-2xl font-black transition-all shadow-2xl shadow-emerald-500/20"
             >
-              Finalize &amp; Settle
+              {isFinalizing ? 'Finalizing…' : 'Finalize & Settle'}
             </button>
           </div>
         </div>
@@ -301,16 +444,47 @@ export default function LiveSessionAdmin({ user, sessionCode, navigate }: Props)
                           ₹{p.pendingOutChips ?? 0}
                         </p>
                         <p className="text-[9px] text-slate-500 font-bold uppercase mt-1">Out chips</p>
+                        {p.pendingPlanAdjustment && (
+                          <p className="text-[9px] text-amber-400 font-black uppercase mt-2">
+                            Plan adjustment requested
+                          </p>
+                        )}
                       </div>
                       <div className="flex gap-3">
                         <button
-                          onClick={async () => { await liveApi.rejectLeave(session!.id, p.userId); refreshData(); }}
+                          onClick={async () => {
+                            const updated = await liveApi.rejectLeave(session!.id, p.userId);
+                            if (updated) {
+                              setPlayers((current) =>
+                                current.map((player) =>
+                                  player.userId === p.userId
+                                    ? { ...player, ...updated, name: player.name }
+                                    : player
+                                )
+                              );
+                            }
+                          }}
                           className="p-4 bg-slate-800 hover:bg-rose-500 text-slate-500 hover:text-white rounded-2xl transition-all active:scale-90"
                         >
                           <X className="w-6 h-6" />
                         </button>
                         <button
-                          onClick={async () => { await liveApi.approveLeave(session!.id, p.userId); refreshData(); }}
+                          onClick={async () => {
+                            const updated = await liveApi.approveLeave(session!.id, p.userId);
+                            if (updated) {
+                              setPlayers((current) =>
+                                current.map((player) =>
+                                  player.userId === p.userId
+                                    ? { ...player, ...updated, name: player.name }
+                                    : player
+                                )
+                              );
+                              setFinalChipCounts((current) => ({
+                                ...current,
+                                [p.userId]: String(updated.finalWinnings ?? 0),
+                              }));
+                            }
+                          }}
                           className="p-4 bg-rose-500/10 text-rose-400 hover:bg-rose-500 hover:text-white rounded-2xl transition-all active:scale-90"
                         >
                           <Check className="w-6 h-6" />
@@ -409,6 +583,20 @@ export default function LiveSessionAdmin({ user, sessionCode, navigate }: Props)
                                   <p className="text-[9px] font-bold text-slate-500 uppercase">
                                     {stats.history.length} Transactions
                                   </p>
+                                  <p className="text-[9px] font-bold text-sky-400 mt-1">
+                                    {p.commitmentType === 'flexible'
+                                      ? 'Flexible Play Plan'
+                                      : `Planned until ${new Date(
+                                          p.commitmentEndAt ?? session.plannedEndAt ?? 0
+                                        ).toLocaleTimeString([], {
+                                          hour: '2-digit',
+                                          minute: '2-digit',
+                                        })}`}
+                                  </p>
+                                  <p className="text-[9px] font-bold text-violet-400 mt-1">
+                                    {Math.floor(activeMinutes(p))} active min
+                                    {isPaused(p.userId) ? ' · On break' : ''}
+                                  </p>
                                 </div>
                               </div>
                             </td>
@@ -427,6 +615,44 @@ export default function LiveSessionAdmin({ user, sessionCode, navigate }: Props)
                             <tr className="bg-slate-950/40">
                               <td colSpan={3} className="px-8 py-6 border-b border-slate-800/50">
                                 <div className="space-y-3">
+                                  {!p.leftAt && (
+                                    <div className="flex items-center justify-between gap-4 p-4 bg-violet-500/5 border border-violet-500/20 rounded-2xl">
+                                      <div>
+                                        <p className="text-[10px] font-black text-violet-400 uppercase tracking-widest">
+                                          Active play timer
+                                        </p>
+                                        <p className="text-xs text-slate-400 mt-1">
+                                          {Math.floor(activeMinutes(p))} minutes counted.
+                                          Breaks are excluded.
+                                        </p>
+                                      </div>
+                                      <button
+                                        type="button"
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          recordBreakEvent(
+                                            p,
+                                            isPaused(p.userId) ? 'resume' : 'pause'
+                                          );
+                                        }}
+                                        className={`px-4 py-3 rounded-xl text-xs font-black flex items-center gap-2 transition-all ${
+                                          isPaused(p.userId)
+                                            ? 'bg-emerald-500 text-slate-950'
+                                            : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                                        }`}
+                                      >
+                                        {isPaused(p.userId) ? (
+                                          <>
+                                            <Play className="w-4 h-4" /> Resume
+                                          </>
+                                        ) : (
+                                          <>
+                                            <Pause className="w-4 h-4" /> Start break
+                                          </>
+                                        )}
+                                      </button>
+                                    </div>
+                                  )}
                                   <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2">
                                     <History className="w-3 h-3" /> Transaction Log
                                   </p>
@@ -486,7 +712,9 @@ export default function LiveSessionAdmin({ user, sessionCode, navigate }: Props)
               <h2 className="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] flex items-center gap-2">
                 <ShieldCheck className="w-4 h-4" /> Global Table Audit Log
               </h2>
-              <span className="text-[9px] font-bold text-slate-600 uppercase">Realtime Feed</span>
+              <span className="text-[9px] font-bold text-slate-600 uppercase">
+                Refresh on demand
+              </span>
             </div>
             <div className="bg-slate-900/50 rounded-[2rem] border border-slate-800 p-2 max-h-80 overflow-y-auto scrollbar-hide shadow-inner">
               {buyIns.length === 0 ? (

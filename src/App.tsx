@@ -42,6 +42,11 @@ import LiveSessionPlayer from './views/LiveSessionPlayer';
 import LiveSettlement from './views/LiveSettlement';
 import PlayerHistoryModal from './components/PlayerHistoryModal';
 import type { LiveUser } from './services/liveApi';
+import {
+  isPokerNowGameLog,
+  parsePokerNowGameLog,
+  type PokerNowAttendance,
+} from './lib/pokerNowLog';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -50,6 +55,15 @@ function cn(...inputs: ClassValue[]) {
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 function monthName(m: string) {
   return MONTH_NAMES[parseInt(m, 10) - 1] || m;
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}`));
+    reader.onload = () => resolve(reader.result as string);
+    reader.readAsDataURL(file);
+  });
 }
 
 // --- Types ---
@@ -64,6 +78,7 @@ interface Session {
   date: string;
   note: string;
   results: { name: string; amount: number }[];
+  attendance: PokerNowAttendance[];
 }
 
 interface Settlement {
@@ -85,6 +100,37 @@ interface PlayerWithAliases {
   name: string;
   aliases: PlayerAlias[];
   session_profit: number;
+}
+
+interface PokerNowTracker {
+  id: string;
+  gameId: string;
+  gameUrl: string;
+  note: string;
+  status: 'active' | 'closed';
+  startedAt: number;
+  endedAt?: number;
+  sessionId: number | null;
+  accessToken: string;
+}
+
+const POKER_NOW_TRACKERS_KEY = 'poker_now_trackers';
+
+function loadPokerNowTrackers(): PokerNowTracker[] {
+  try {
+    const stored = JSON.parse(localStorage.getItem(POKER_NOW_TRACKERS_KEY) ?? '[]');
+    return Array.isArray(stored)
+      ? stored.filter(
+          (tracker): tracker is PokerNowTracker =>
+            tracker &&
+            typeof tracker.id === 'string' &&
+            tracker.status === 'active' &&
+            typeof tracker.accessToken === 'string'
+        )
+      : [];
+  } catch {
+    return [];
+  }
 }
 
 // --- Components ---
@@ -118,6 +164,8 @@ export default function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [settlements, setSettlements] = useState<Settlement[]>([]);
   const [playersWithAliases, setPlayersWithAliases] = useState<PlayerWithAliases[]>([]);
+  const [pokerNowTrackers, setPokerNowTrackers] =
+    useState<PokerNowTracker[]>(loadPokerNowTrackers);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [showConfirmModal, setShowConfirmModal] = useState(false);
@@ -125,9 +173,15 @@ export default function App() {
   const openSettlementModal = useRef(() => setShowSettlementModal(true));
   useEffect(() => { openSettlementModal.current = () => setShowSettlementModal(true); }, [setShowSettlementModal]);
   const [pendingResults, setPendingResults] = useState<ExtractedResult[]>([]);
+  const [pendingAttendance, setPendingAttendance] = useState<PokerNowAttendance[]>([]);
   const [sessionNote, setSessionNote] = useState('');
   const [sessionDate, setSessionDate] = useState(new Date().toISOString().split('T')[0]);
   const [isManualEntry, setIsManualEntry] = useState(false);
+  const [pokerNowLink, setPokerNowLink] = useState('');
+  const [pokerNowNote, setPokerNowNote] = useState('');
+  const [isStartingPokerNow, setIsStartingPokerNow] = useState(false);
+  const [finishingPokerNowId, setFinishingPokerNowId] = useState<string | null>(null);
+  const [pokerNowError, setPokerNowError] = useState<string | null>(null);
   const [newAliasInputs, setNewAliasInputs] = useState<Record<number, string>>({});
   const [mergeSource, setMergeSource] = useState<number | null>(null);
   const [aliasError, setAliasError] = useState<string | null>(null);
@@ -156,7 +210,16 @@ export default function App() {
   useEffect(() => {
     const stored = localStorage.getItem('live_poker_user');
     if (stored) {
-      try { setLiveUser(JSON.parse(stored)); } catch { /* ignore */ }
+      try {
+        const parsed = JSON.parse(stored);
+        if (typeof parsed?.authToken === 'string') {
+          setLiveUser(parsed);
+        } else {
+          localStorage.removeItem('live_poker_user');
+        }
+      } catch {
+        localStorage.removeItem('live_poker_user');
+      }
     }
   }, []);
 
@@ -225,87 +288,89 @@ export default function App() {
     fetchData();
   }, []);
 
-  const fetchData = async () => {
-    // Each endpoint is fetched independently so one failure doesn't wipe
-    // unrelated state. On !ok (e.g. DB down → 500) or a JSON parse failure,
-    // fall back to an empty array so downstream .filter/.map calls don't
-    // crash at render time.
-    const safeJson = async <T,>(url: string): Promise<T[]> => {
-      try {
-        const res = await fetch(url);
-        if (!res.ok) return [];
-        const body = await res.json();
-        return Array.isArray(body) ? body : [];
-      } catch (err) {
-        console.error(`fetch ${url} failed:`, err);
-        return [];
-      }
-    };
+  useEffect(() => {
+    localStorage.setItem(POKER_NOW_TRACKERS_KEY, JSON.stringify(pokerNowTrackers));
+  }, [pokerNowTrackers]);
 
-    const [p, s, st, a] = await Promise.all([
-      safeJson<Player>('/api/players'),
-      safeJson<Session>('/api/sessions'),
-      safeJson<Settlement>('/api/settlements'),
-      safeJson<PlayerWithAliases>('/api/players/aliases'),
-    ]);
-    setPlayers(p);
-    setSessions(s);
-    setSettlements(st);
-    setPlayersWithAliases(a);
+  const fetchData = async () => {
+    try {
+      const response = await fetch('/api/bootstrap');
+      if (!response.ok) throw new Error(`Bootstrap failed (${response.status})`);
+      const data = await response.json();
+      setPlayers(Array.isArray(data.players) ? data.players : []);
+      setSessions(Array.isArray(data.sessions) ? data.sessions : []);
+      setSettlements(Array.isArray(data.settlements) ? data.settlements : []);
+      setPlayersWithAliases(
+        Array.isArray(data.playersWithAliases) ? data.playersWithAliases : []
+      );
+    } catch (error) {
+      console.error('Failed to load application data:', error);
+    }
   };
 
   const onDrop = async (acceptedFiles: File[]) => {
-    const file = acceptedFiles[0];
-    if (!file) return;
+    if (acceptedFiles.length === 0) return;
     setIsUploading(true);
     setUploadError(null);
+    setPendingAttendance([]);
 
     try {
-      if (file.type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
-        file.type === 'application/vnd.ms-excel' ||
-        file.name.endsWith('.xlsx') ||
-        file.name.endsWith('.xls')) {
+      let gameLogAttendance: PokerNowAttendance[] = [];
+      let resultFile: File | undefined;
 
-        const reader = new FileReader();
-        reader.onload = async (e) => {
-          const data = new Uint8Array(e.target?.result as ArrayBuffer);
-          const workbook = XLSX.read(data, { type: 'array' });
-          const firstSheetName = workbook.SheetNames[0];
-          const worksheet = workbook.Sheets[firstSheetName];
-          const json = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
-          const textData = JSON.stringify(json);
-
-          try {
-            const results = await extractPokerResults(textData, 'text/plain', true);
-            setPendingResults(results);
-            setIsManualEntry(false);
-            setShowConfirmModal(true);
-          } catch (error: any) {
-            setUploadError(error.message || "Failed to process Excel data. Please try again.");
-          } finally {
-            setIsUploading(false);
+      for (const file of acceptedFiles) {
+        if (file.name.toLowerCase().endsWith('.csv') || file.type === 'text/csv') {
+          const text = await file.text();
+          if (isPokerNowGameLog(text)) {
+            gameLogAttendance = parsePokerNowGameLog(text);
+            continue;
           }
-        };
-        reader.readAsArrayBuffer(file);
-      } else {
-        const reader = new FileReader();
-        reader.onload = async () => {
-          const base64 = reader.result as string;
-          try {
-            const results = await extractPokerResults(base64, file.type);
-            setPendingResults(results);
-            setIsManualEntry(false);
-            setShowConfirmModal(true);
-          } catch (error: any) {
-            setUploadError(error.message || "Failed to process file. Check that the file contains readable poker session data.");
-          } finally {
-            setIsUploading(false);
-          }
-        };
-        reader.readAsDataURL(file);
+        }
+        resultFile ??= file;
       }
-    } catch (error) {
+
+      let results: ExtractedResult[];
+      if (!resultFile) {
+        if (gameLogAttendance.length === 0) {
+          throw new Error('No supported session data was found.');
+        }
+        results = gameLogAttendance.map((player) => ({ name: player.name, amount: 0 }));
+      } else if (
+        resultFile.type ===
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+        resultFile.type === 'application/vnd.ms-excel' ||
+        resultFile.name.toLowerCase().endsWith('.xlsx') ||
+        resultFile.name.toLowerCase().endsWith('.xls')
+      ) {
+        const data = new Uint8Array(await resultFile.arrayBuffer());
+        const workbook = XLSX.read(data, { type: 'array' });
+        const firstSheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[firstSheetName];
+        const json = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+        results = await extractPokerResults(JSON.stringify(json), 'text/plain', true);
+      } else if (
+        resultFile.name.toLowerCase().endsWith('.csv') ||
+        resultFile.type === 'text/csv'
+      ) {
+        results = await extractPokerResults(await resultFile.text(), 'text/plain', true);
+      } else {
+        results = await extractPokerResults(
+          await readFileAsDataUrl(resultFile),
+          resultFile.type
+        );
+      }
+
+      setPendingAttendance(gameLogAttendance);
+      setPendingResults(results);
+      setIsManualEntry(!resultFile);
+      setShowConfirmModal(true);
+    } catch (error: any) {
       console.error("File processing error", error);
+      setUploadError(
+        error.message ||
+          'Failed to process the files. Check that they contain readable poker session data.'
+      );
+    } finally {
       setIsUploading(false);
     }
   };
@@ -316,10 +381,93 @@ export default function App() {
       'image/*': [],
       'application/pdf': [],
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
-      'application/vnd.ms-excel': ['.xls']
+      'application/vnd.ms-excel': ['.xls'],
+      'text/csv': ['.csv'],
     },
-    multiple: false
+    multiple: true
   } as any);
+
+  const startPokerNowTracking = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!pokerNowLink.trim() || isStartingPokerNow) return;
+    setPokerNowError(null);
+    setIsStartingPokerNow(true);
+    const pendingTokenKey = `poker_now_start_token:${pokerNowLink.trim()}`;
+    const accessToken =
+      localStorage.getItem(pendingTokenKey) ??
+      `${crypto.randomUUID()}${crypto.randomUUID()}`;
+    localStorage.setItem(pendingTokenKey, accessToken);
+    try {
+      const response = await fetch('/api/pokernow/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: pokerNowLink,
+          note: pokerNowNote,
+          accessToken,
+        }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || 'Could not start tracking.');
+      setPokerNowTrackers((current) => [
+        { ...body.tracker, accessToken },
+        ...current.filter((tracker) => tracker.id !== body.tracker.id),
+      ]);
+      localStorage.removeItem(pendingTokenKey);
+      setPokerNowLink('');
+      setPokerNowNote('');
+    } catch (error) {
+      setPokerNowError(
+        error instanceof Error ? error.message : 'Could not start PokerNow tracking.'
+      );
+    } finally {
+      setIsStartingPokerNow(false);
+    }
+  };
+
+  const finalizePokerNowTracking = async (
+    tracker: PokerNowTracker,
+    file: File
+  ) => {
+    setPokerNowError(null);
+    setFinishingPokerNowId(tracker.id);
+    try {
+      const text = await file.text();
+      if (!isPokerNowGameLog(text)) {
+        throw new Error('Choose the PokerNow Game Log CSV, not the ledger CSV.');
+      }
+      const attendance = parsePokerNowGameLog(text, {
+        startAt: tracker.startedAt,
+        endAt: Date.now(),
+      });
+      if (attendance.length === 0) {
+        throw new Error('No completed hands were found after tracking started.');
+      }
+      const response = await fetch(`/api/pokernow/${tracker.id}/finalize`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tracker.accessToken}`,
+        },
+        body: JSON.stringify({
+          attendance,
+          date: new Date().toISOString().slice(0, 10),
+        }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || 'Could not finalize PokerNow session.');
+      setPokerNowTrackers((current) =>
+        current.filter((candidate) => candidate.id !== tracker.id)
+      );
+      await fetchData();
+    } catch (error) {
+      setPokerNowError(
+        error instanceof Error ? error.message : 'Could not finalize PokerNow tracking.'
+      );
+    } finally {
+      setFinishingPokerNowId(null);
+    }
+  };
 
   const [isSaving, setIsSaving] = useState(false);
 
@@ -338,12 +486,14 @@ export default function App() {
         body: JSON.stringify({
           date: sessionDate,
           note: sessionNote,
-          results: validResults
+          results: validResults,
+          attendance: pendingAttendance,
         })
       });
       if (response.ok) {
         setShowConfirmModal(false);
         setPendingResults([]);
+        setPendingAttendance([]);
         setSessionNote('');
         fetchData();
       }
@@ -435,6 +585,7 @@ export default function App() {
 
   const openManualEntry = () => {
     setPendingResults(players.map(p => ({ name: p.name, amount: 0 })));
+    setPendingAttendance([]);
     setSessionNote('');
     setSessionDate(new Date().toISOString().split('T')[0]);
     setIsManualEntry(true);
@@ -821,6 +972,108 @@ export default function App() {
               exit={{ opacity: 0, y: -20 }}
               className="space-y-8"
             >
+              <section className="bg-sky-500/5 border border-sky-500/20 rounded-[2rem] p-6 md:p-8 space-y-6">
+                <div className="flex items-start gap-4">
+                  <div className="w-12 h-12 rounded-2xl bg-sky-500/10 text-sky-400 flex items-center justify-center shrink-0">
+                    <Link2 size={22} />
+                  </div>
+                  <div>
+                    <h2 className="font-black text-xl uppercase italic tracking-tighter text-white">
+                      Track a PokerNow game
+                    </h2>
+                    <p className="text-xs text-zinc-500 mt-1">
+                      Save the link at the start. At the end, P/L is fetched automatically
+                      and the Game Log calculates dealt-in time.
+                    </p>
+                  </div>
+                </div>
+
+                <form
+                  onSubmit={startPokerNowTracking}
+                  className="grid grid-cols-1 md:grid-cols-[1fr_0.7fr_auto] gap-3"
+                >
+                  <input
+                    type="url"
+                    required
+                    value={pokerNowLink}
+                    onChange={(event) => setPokerNowLink(event.target.value)}
+                    placeholder="https://www.pokernow.com/games/pgl..."
+                    className="w-full px-4 py-3.5 bg-black/30 border border-white/10 rounded-xl outline-none focus:ring-2 focus:ring-sky-500 text-sm text-white"
+                  />
+                  <input
+                    type="text"
+                    value={pokerNowNote}
+                    onChange={(event) => setPokerNowNote(event.target.value)}
+                    placeholder="Session name (optional)"
+                    className="w-full px-4 py-3.5 bg-black/30 border border-white/10 rounded-xl outline-none focus:ring-2 focus:ring-sky-500 text-sm text-white"
+                  />
+                  <button
+                    type="submit"
+                    disabled={isStartingPokerNow || !pokerNowLink.trim()}
+                    className="px-5 py-3.5 bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-slate-950 rounded-xl font-black text-xs uppercase tracking-wider transition-all"
+                  >
+                    {isStartingPokerNow ? 'Starting…' : 'Start tracking'}
+                  </button>
+                </form>
+
+                {pokerNowTrackers.length > 0 && (
+                  <div className="space-y-3">
+                    {pokerNowTrackers.map((tracker) => (
+                      <div
+                        key={tracker.id}
+                        className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 bg-black/20 border border-sky-500/10 rounded-2xl"
+                      >
+                        <div>
+                          <p className="font-black text-zinc-200">
+                            {tracker.note || tracker.gameId}
+                          </p>
+                          <p className="text-[10px] text-zinc-500 mt-1">
+                            Tracking since{' '}
+                            {new Date(tracker.startedAt).toLocaleString([], {
+                              hour: '2-digit',
+                              minute: '2-digit',
+                              day: '2-digit',
+                              month: 'short',
+                            })}
+                          </p>
+                        </div>
+                        <label
+                          className={`px-5 py-3 rounded-xl text-xs font-black uppercase tracking-wider cursor-pointer transition-all ${
+                            finishingPokerNowId === tracker.id
+                              ? 'bg-zinc-700 text-zinc-400 pointer-events-none'
+                              : 'bg-emerald-500 text-slate-950 hover:bg-emerald-400'
+                          }`}
+                        >
+                          {finishingPokerNowId === tracker.id
+                            ? 'Finalizing…'
+                            : 'Finish with Game Log'}
+                          <input
+                            type="file"
+                            accept=".csv,text/csv"
+                            className="hidden"
+                            onChange={(event) => {
+                              const file = event.target.files?.[0];
+                              if (file) void finalizePokerNowTracking(tracker, file);
+                              event.target.value = '';
+                            }}
+                          />
+                        </label>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {pokerNowError && (
+                  <p className="text-xs font-bold text-rose-400 flex items-center gap-2">
+                    <AlertCircle size={15} /> {pokerNowError}
+                  </p>
+                )}
+                <p className="text-[10px] text-zinc-600">
+                  Two app requests per game: one ledger baseline at start and one final
+                  ledger snapshot at close. The Game Log stays in your browser.
+                </p>
+              </section>
+
               {/* Upload Area */}
               <div
                 {...getRootProps()}
@@ -842,7 +1095,12 @@ export default function App() {
                   </div>
                   <div>
                     <p className="font-black text-2xl uppercase tracking-tighter italic">Import Session Data</p>
-                    <p className="text-zinc-500 text-xs font-bold uppercase tracking-widest mt-2">Drag & drop Screenshot, PDF or Excel</p>
+                    <p className="text-zinc-500 text-xs font-bold uppercase tracking-widest mt-2">
+                      Screenshot, PDF, Excel or PokerNow CSV
+                    </p>
+                    <p className="text-zinc-600 text-[10px] mt-2">
+                      Drop a PokerNow ledger and Game Log together to include attendance.
+                    </p>
                   </div>
                 </div>
               </div>
@@ -894,6 +1152,49 @@ export default function App() {
                           </div>
                         ))}
                       </div>
+                      {(session.attendance ?? []).length > 0 && (
+                        <div className="mt-8 pt-6 border-t border-white/5">
+                          <div className="flex items-center justify-between mb-4">
+                            <h3 className="text-[10px] font-black text-sky-400 uppercase tracking-[0.2em] flex items-center gap-2">
+                              <Clock size={13} /> PokerNow dealt-in time
+                            </h3>
+                            <span className="text-[9px] font-bold text-zinc-600 uppercase">
+                              Evidence only · unscored
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            {(session.attendance ?? []).map((entry) => (
+                              <div
+                                key={entry.externalId}
+                                className="flex items-center justify-between gap-4 px-4 py-3 bg-sky-500/5 border border-sky-500/10 rounded-xl"
+                              >
+                                <div>
+                                  <p className="text-xs font-black text-zinc-200">{entry.name}</p>
+                                  <p className="text-[9px] text-zinc-500 mt-1">
+                                    {new Date(entry.joinedAt).toLocaleTimeString([], {
+                                      hour: '2-digit',
+                                      minute: '2-digit',
+                                    })}{' '}
+                                    –{' '}
+                                    {new Date(entry.leftAt).toLocaleTimeString([], {
+                                      hour: '2-digit',
+                                      minute: '2-digit',
+                                    })}
+                                  </p>
+                                </div>
+                                <div className="text-right">
+                                  <p className="text-sm font-black text-sky-400">
+                                    {Math.round(entry.durationMinutes)} min
+                                  </p>
+                                  <p className="text-[8px] font-black text-zinc-600 uppercase">
+                                    {entry.handCount} hands · {entry.confidence}
+                                  </p>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </motion.div>
                 ))}
@@ -1306,7 +1607,7 @@ export default function App() {
                   </div>
                 </motion.div>
 
-                {/* Loss Exit Rule */}
+                {/* Play Plan */}
                 <motion.div
                   initial={{ opacity: 0, x: 20 }}
                   animate={{ opacity: 1, x: 0 }}
@@ -1318,14 +1619,14 @@ export default function App() {
                       <DoorOpen size={28} className="text-rose-400" />
                     </div>
                     <div>
-                      <h3 className="font-black text-lg uppercase italic tracking-tighter">Loss Exit Rule</h3>
-                      <p className="text-[10px] text-rose-400 font-bold uppercase tracking-[0.2em]">Exit When Down</p>
+                      <h3 className="font-black text-lg uppercase italic tracking-tighter">Play Plan</h3>
+                      <p className="text-[10px] text-rose-400 font-bold uppercase tracking-[0.2em]">Coordinate, Don&apos;t Pressure</p>
                     </div>
                   </div>
                   <div className="space-y-3 text-sm text-zinc-400">
-                    <p>Players are allowed to <span className="text-white font-bold">leave the table anytime</span> if they are in a loss.</p>
+                    <p>Before play, choose a <span className="text-white font-bold">full-session, timed, or flexible</span> plan so the table can coordinate seats.</p>
                     <div className="bg-rose-500/5 border border-rose-500/10 rounded-xl p-4">
-                      <p className="text-rose-300 font-bold text-xs">Leaving is NOT permitted while in profit, even during the committed game time.</p>
+                      <p className="text-rose-300 font-bold text-xs">Plans never depend on winnings and never require anyone to continue playing or rebuy.</p>
                     </div>
                   </div>
                 </motion.div>
@@ -1430,6 +1731,40 @@ export default function App() {
                     />
                   </div>
                 </div>
+
+                {pendingAttendance.length > 0 && (
+                  <section className="space-y-4 p-5 rounded-2xl bg-sky-500/5 border border-sky-500/20">
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <h4 className="text-sm font-black text-sky-400 uppercase tracking-wider">
+                          PokerNow dealt-in time found
+                        </h4>
+                        <p className="text-[10px] text-zinc-500 mt-1">
+                          Parsed locally from completed hands in the Game Log. With no
+                          pre-session Play Plan, these times are evidence only and stay unscored.
+                        </p>
+                      </div>
+                      <span className="text-[9px] font-black text-sky-400 bg-sky-500/10 px-3 py-1 rounded-full whitespace-nowrap">
+                        {pendingAttendance.length} players
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      {pendingAttendance.map((entry) => (
+                        <div
+                          key={entry.externalId}
+                          className="flex items-center justify-between gap-3 bg-black/20 px-3 py-2.5 rounded-xl"
+                        >
+                          <span className="text-xs font-bold text-zinc-300 truncate">
+                            {entry.name}
+                          </span>
+                          <span className="text-[9px] font-black text-sky-400 whitespace-nowrap">
+                            {Math.round(entry.durationMinutes)} min · {entry.handCount} hands
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                )}
 
                 <div className="space-y-4">
                   <div className="flex items-center justify-between px-2 text-[10px] font-black text-zinc-500 uppercase tracking-[0.2em]">

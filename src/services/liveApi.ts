@@ -3,6 +3,8 @@
 // All routes are under /api/live/ to avoid colliding with Fishes routes.
 // ---------------------------------------------------------------------------
 
+import type { CommitmentType } from '../lib/playPlan';
+
 const BASE = '/api/live';
 
 // ── Types ───────────────────────────────────────────────────────────────────
@@ -12,6 +14,7 @@ export interface LiveUser {
   name: string;
   username: string;
   mobile?: string;
+  authToken: string;
 }
 
 export interface LiveSession {
@@ -22,6 +25,8 @@ export interface LiveSession {
   status: 'active' | 'closed';
   createdAt: number;
   closedAt?: number;
+  plannedEndAt?: number;
+  endReason?: 'completed' | 'table_break' | 'ended_early';
   blindValue?: string;
   publishedToLedger: boolean;
   publishedSessionId: number | null;
@@ -36,6 +41,12 @@ export interface LiveSessionPlayer {
   leftAt?: number;
   leavePending: boolean;
   pendingOutChips?: number;
+  joinedAt: number;
+  commitmentType: CommitmentType;
+  commitmentStartAt?: number;
+  commitmentEndAt?: number;
+  commitmentAdjusted: boolean;
+  pendingPlanAdjustment: boolean;
 }
 
 export interface LiveBuyIn {
@@ -68,6 +79,21 @@ export interface LiveSettlementTx {
   amount: number;
 }
 
+export interface LiveAttendanceEvent {
+  id: string;
+  sessionId: string;
+  userId: string;
+  eventType: 'join' | 'rejoin' | 'leave' | 'pause' | 'resume';
+  occurredAt: number;
+}
+
+export interface LiveSessionSnapshot {
+  session: LiveSession;
+  players: LiveSessionPlayer[];
+  buyIns: LiveBuyIn[];
+  attendanceEvents: LiveAttendanceEvent[];
+}
+
 // ── Mappers ─────────────────────────────────────────────────────────────────
 
 const mapUser = (u: any): LiveUser => ({
@@ -75,6 +101,7 @@ const mapUser = (u: any): LiveUser => ({
   name: u.name,
   username: u.username,
   mobile: u.mobile,
+  authToken: u.authToken,
 });
 
 const mapSession = (s: any): LiveSession => ({
@@ -85,6 +112,8 @@ const mapSession = (s: any): LiveSession => ({
   status: s.status,
   createdAt: new Date(s.created_at).getTime(),
   closedAt: s.closed_at ? new Date(s.closed_at).getTime() : undefined,
+  plannedEndAt: s.planned_end_at ? new Date(s.planned_end_at).getTime() : undefined,
+  endReason: s.end_reason,
   blindValue: s.blind_value,
   publishedToLedger: s.published_to_ledger === true,
   publishedSessionId:
@@ -100,6 +129,17 @@ const mapPlayer = (p: any): LiveSessionPlayer => ({
   leftAt: p.left_at != null ? new Date(p.left_at).getTime() : undefined,
   leavePending: p.leave_pending === true || p.leave_pending === 't',
   pendingOutChips: p.pending_out_chips != null ? parseFloat(p.pending_out_chips) : undefined,
+  joinedAt: p.joined_at ? new Date(p.joined_at).getTime() : 0,
+  commitmentType: p.commitment_type ?? 'flexible',
+  commitmentStartAt: p.commitment_start_at
+    ? new Date(p.commitment_start_at).getTime()
+    : undefined,
+  commitmentEndAt: p.commitment_end_at
+    ? new Date(p.commitment_end_at).getTime()
+    : undefined,
+  commitmentAdjusted: p.commitment_adjusted === true || p.commitment_adjusted === 't',
+  pendingPlanAdjustment:
+    p.pending_plan_adjustment === true || p.pending_plan_adjustment === 't',
 });
 
 const mapBuyIn = (b: any): LiveBuyIn => ({
@@ -110,6 +150,60 @@ const mapBuyIn = (b: any): LiveBuyIn => ({
   status: b.status,
   timestamp: new Date(b.timestamp).getTime(),
 });
+
+const mapAttendanceEvent = (event: any): LiveAttendanceEvent => ({
+  id: event.id,
+  sessionId: event.session_id,
+  userId: event.user_id,
+  eventType: event.event_type,
+  occurredAt: new Date(event.occurred_at).getTime(),
+});
+
+const mapPlayerStats = (data: any): LivePlayerStats => {
+  const history: LiveSessionPLPoint[] = Array.isArray(data.history)
+    ? data.history.map((historyPoint: any) => ({
+        sessionId: historyPoint.sessionId,
+        sessionName: historyPoint.sessionName,
+        date:
+          typeof historyPoint.date === 'number'
+            ? historyPoint.date
+            : new Date(historyPoint.date).getTime(),
+        pl:
+          typeof historyPoint.pl === 'number'
+            ? historyPoint.pl
+            : parseFloat(historyPoint.pl),
+      }))
+    : [];
+  return {
+    weeklyPL: Number(data.weeklyPL) || 0,
+    monthlyPL: Number(data.monthlyPL) || 0,
+    yearlyPL: Number(data.yearlyPL) || 0,
+    totalPL: Number(data.totalPL) || 0,
+    history,
+  };
+};
+
+const mapSnapshot = (data: any): LiveSessionSnapshot => ({
+  session: mapSession(data.session),
+  players: (data.players ?? []).map(mapPlayer),
+  buyIns: (data.buyIns ?? []).map(mapBuyIn),
+  attendanceEvents: (data.attendanceEvents ?? []).map(mapAttendanceEvent),
+});
+
+const sessionCache = new Map<string, LiveSessionSnapshot>();
+
+function cacheSnapshot(snapshot: LiveSessionSnapshot) {
+  sessionCache.set(snapshot.session.id, snapshot);
+  sessionCache.set(snapshot.session.sessionCode.toUpperCase(), snapshot);
+}
+
+function takeCachedSnapshot(idOrCode: string): LiveSessionSnapshot | null {
+  const snapshot = sessionCache.get(idOrCode) ?? sessionCache.get(idOrCode.toUpperCase());
+  if (!snapshot) return null;
+  sessionCache.delete(snapshot.session.id);
+  sessionCache.delete(snapshot.session.sessionCode.toUpperCase());
+  return snapshot;
+}
 
 // ── Generic fetch helper ─────────────────────────────────────────────────────
 
@@ -146,7 +240,7 @@ export const liveApi = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, username, password }),
     });
-    if (!r.ok) return { success: false, error: r.error };
+    if (r.ok === false) return { success: false, error: r.error };
     return { success: true, user: mapUser(r.data.user) };
   },
 
@@ -159,7 +253,7 @@ export const liveApi = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     });
-    if (!r.ok) return { success: false, error: r.error };
+    if (r.ok === false) return { success: false, error: r.error };
     return { success: true, user: mapUser(r.data.user) };
   },
 
@@ -171,72 +265,115 @@ export const liveApi = {
     return data.map(mapSession);
   },
 
+  getLobby: async (
+    userId: string
+  ): Promise<{ sessions: LiveSession[]; stats: LivePlayerStats } | null> => {
+    const r = await apiFetch<any>(`${BASE}/lobby/${encodeURIComponent(userId)}`);
+    if (r.ok === false) return null;
+    return {
+      sessions: (r.data.sessions ?? []).map(mapSession),
+      stats: mapPlayerStats(r.data.stats ?? {}),
+    };
+  },
+
   createSession: async (
     name: string,
     blindValue: string,
-    createdBy: string
+    createdBy: string,
+    plannedDurationMinutes: number,
+    hostCommitmentType: CommitmentType = 'full',
+    hostCommitmentMinutes?: number
   ): Promise<{ success: boolean; session?: LiveSession; error?: string }> => {
     const r = await apiFetch<any>(`${BASE}/sessions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, blindValue, createdBy }),
+      body: JSON.stringify({
+        name,
+        blindValue,
+        createdBy,
+        plannedDurationMinutes,
+        hostCommitmentType,
+        hostCommitmentMinutes,
+      }),
     });
-    if (!r.ok) return { success: false, error: r.error };
-    return { success: true, session: mapSession(r.data) };
+    if (r.ok === false) return { success: false, error: r.error };
+    const snapshot = mapSnapshot(r.data);
+    cacheSnapshot(snapshot);
+    return { success: true, session: snapshot.session };
   },
 
   getSession: async (
     idOrCode: string
-  ): Promise<{ session: LiveSession; players: LiveSessionPlayer[]; buyIns: LiveBuyIn[] } | null> => {
+  ): Promise<LiveSessionSnapshot | null> => {
+    const cached = takeCachedSnapshot(idOrCode);
+    if (cached) return cached;
     const res = await fetch(`${BASE}/session/${encodeURIComponent(idOrCode)}`);
     if (!res.ok) return null;
-    const data = await res.json();
-    return {
-      session: mapSession(data.session),
-      players: data.players.map(mapPlayer),
-      buyIns: data.buyIns.map(mapBuyIn),
-    };
+    return mapSnapshot(await res.json());
   },
 
   joinSession: async (
     code: string,
     userId: string,
-    role: 'admin' | 'player' = 'player'
-  ): Promise<{ success: boolean; error?: string; player?: LiveSessionPlayer; sessionId?: string }> => {
-    const r = await apiFetch<{ player: any; sessionId: string }>(`${BASE}/session/join`, {
+    role: 'admin' | 'player' = 'player',
+    commitmentType: CommitmentType = 'flexible',
+    commitmentMinutes?: number
+  ): Promise<{
+    success: boolean;
+    error?: string;
+    player?: LiveSessionPlayer;
+    session?: LiveSession;
+    sessionId?: string;
+  }> => {
+    const r = await apiFetch<any>(`${BASE}/session/join`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, userId, role }),
+      body: JSON.stringify({ code, userId, role, commitmentType, commitmentMinutes }),
     });
-    if (!r.ok) return { success: false, error: r.error };
-    return { success: true, player: mapPlayer(r.data.player), sessionId: r.data.sessionId };
+    if (r.ok === false) return { success: false, error: r.error };
+    const snapshot = mapSnapshot(r.data);
+    cacheSnapshot(snapshot);
+    return {
+      success: true,
+      player: snapshot.players.find((player) => player.userId === userId),
+      session: snapshot.session,
+      sessionId: snapshot.session.id,
+    };
   },
 
   requestBuyIn: async (
     sessionId: string,
     userId: string,
     amount: number,
+    authToken: string,
     status: 'pending' | 'approved' = 'pending'
   ): Promise<{ success: boolean; error?: string; buyIn?: LiveBuyIn }> => {
     const r = await apiFetch<{ buyIn: any }>(`${BASE}/session/buyin`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authToken}`,
+      },
       body: JSON.stringify({ sessionId, userId, amount, status }),
     });
-    if (!r.ok) return { success: false, error: r.error };
+    if (r.ok === false) return { success: false, error: r.error };
     return { success: true, buyIn: mapBuyIn(r.data.buyIn) };
   },
 
   updateBuyInStatus: async (
     buyInId: string,
-    status: 'pending' | 'approved' | 'rejected'
-  ): Promise<boolean> => {
-    const res = await fetch(`${BASE}/buyin/${buyInId}`, {
+    status: 'approved' | 'rejected',
+    authToken: string
+  ): Promise<LiveBuyIn | null> => {
+    const r = await apiFetch<any>(`${BASE}/buyin/${buyInId}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authToken}`,
+      },
       body: JSON.stringify({ status }),
     });
-    return res.ok;
+    return r.ok ? mapBuyIn(r.data) : null;
   },
 
   updateSessionStatus: async (
@@ -267,33 +404,61 @@ export const liveApi = {
   leaveSession: async (
     sessionId: string,
     userId: string,
-    outChips: number
-  ): Promise<{ success: boolean; error?: string }> => {
+    outChips: number,
+    adjustPlan: boolean
+  ): Promise<{ success: boolean; error?: string; player?: LiveSessionPlayer }> => {
     const r = await apiFetch<{ player: any }>(`${BASE}/session/leave`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId, userId, outChips }),
+      body: JSON.stringify({ sessionId, userId, outChips, adjustPlan }),
     });
-    if (!r.ok) return { success: false, error: r.error };
-    return { success: true };
+    if (r.ok === false) return { success: false, error: r.error };
+    return { success: true, player: mapPlayer(r.data.player) };
   },
 
-  approveLeave: async (sessionId: string, userId: string): Promise<boolean> => {
-    const res = await fetch(`${BASE}/session/leave/approve`, {
+  approveLeave: async (
+    sessionId: string,
+    userId: string
+  ): Promise<LiveSessionPlayer | null> => {
+    const r = await apiFetch<{ player: any }>(`${BASE}/session/leave/approve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionId, userId }),
     });
-    return res.ok;
+    return r.ok ? mapPlayer(r.data.player) : null;
   },
 
-  rejectLeave: async (sessionId: string, userId: string): Promise<boolean> => {
-    const res = await fetch(`${BASE}/session/leave/reject`, {
+  rejectLeave: async (
+    sessionId: string,
+    userId: string
+  ): Promise<LiveSessionPlayer | null> => {
+    const r = await apiFetch<{ player: any }>(`${BASE}/session/leave/reject`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionId, userId }),
     });
-    return res.ok;
+    return r.ok ? mapPlayer(r.data.player) : null;
+  },
+
+  finalizeSession: async (
+    sessionId: string,
+    results: Array<{ userId: string; winnings: number }>,
+    endReason: 'completed' | 'table_break' | 'ended_early',
+    attendanceEvents: LiveAttendanceEvent[],
+    authToken: string
+  ): Promise<{ success: boolean; error?: string; snapshot?: LiveSessionSnapshot }> => {
+    const r = await apiFetch<any>(`${BASE}/session/finalize`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({ sessionId, results, endReason, attendanceEvents }),
+    });
+    if (r.ok === false) return { success: false, error: r.error };
+    const snapshot = mapSnapshot(r.data);
+    cacheSnapshot(snapshot);
+    return { success: true, snapshot };
   },
 
   publishToLedger: async (
@@ -324,21 +489,6 @@ export const liveApi = {
   getUserStats: async (userId: string): Promise<LivePlayerStats> => {
     const res = await fetch(`${BASE}/stats/${encodeURIComponent(userId)}`);
     if (!res.ok) return { weeklyPL: 0, monthlyPL: 0, yearlyPL: 0, totalPL: 0, history: [] };
-    const data = await res.json();
-    const history: LiveSessionPLPoint[] = Array.isArray(data.history)
-      ? data.history.map((h: any) => ({
-          sessionId: h.sessionId,
-          sessionName: h.sessionName,
-          date: typeof h.date === 'number' ? h.date : new Date(h.date).getTime(),
-          pl: typeof h.pl === 'number' ? h.pl : parseFloat(h.pl),
-        }))
-      : [];
-    return {
-      weeklyPL: Number(data.weeklyPL) || 0,
-      monthlyPL: Number(data.monthlyPL) || 0,
-      yearlyPL: Number(data.yearlyPL) || 0,
-      totalPL: Number(data.totalPL) || 0,
-      history,
-    };
+    return mapPlayerStats(await res.json());
   },
 };

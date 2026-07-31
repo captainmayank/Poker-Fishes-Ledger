@@ -5,6 +5,7 @@ import {
 import { aggregateTableBuyIns, tablePot as computeTablePot, potShare } from '../lib/buyIns';
 import {
   Clock, Wallet, CheckCircle, AlertCircle, Plus, Zap, History, DollarSign, ShieldCheck, Users, LogOut, LogIn,
+  RefreshCw, CalendarClock,
 } from 'lucide-react';
 
 interface Props {
@@ -26,6 +27,7 @@ export default function LiveSessionPlayer({ user, sessionCode, navigate }: Props
   const [hasLeft, setHasLeft] = useState(false);
   const [leavePending, setLeavePending] = useState(false);
   const [pendingOutChips, setPendingOutChips] = useState<number | undefined>(undefined);
+  const [adjustPlan, setAdjustPlan] = useState(false);
 
   const refreshData = async () => {
     const data = await liveApi.getSession(sessionCode);
@@ -57,17 +59,22 @@ export default function LiveSessionPlayer({ user, sessionCode, navigate }: Props
 
   useEffect(() => {
     refreshData();
-    const interval = setInterval(refreshData, 3000);
-    return () => clearInterval(interval);
   }, [sessionCode]);
 
   const handleRequest = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!session || !amount || parseFloat(amount) <= 0) return;
-    await liveApi.requestBuyIn(session.id, user.id, parseFloat(amount));
+    const result = await liveApi.requestBuyIn(
+      session.id,
+      user.id,
+      parseFloat(amount),
+      user.authToken
+    );
+    if (!result.success || !result.buyIn) return;
+    setBuyIns((current) => [result.buyIn!, ...current]);
+    setAllBuyIns((current) => [...current, result.buyIn!]);
     setAmount('');
     setIsRequesting(false);
-    refreshData();
   };
 
   const handleLeave = async (e: React.FormEvent) => {
@@ -79,27 +86,39 @@ export default function LiveSessionPlayer({ user, sessionCode, navigate }: Props
       return;
     }
     setLeaveError('');
-    const result = await liveApi.leaveSession(session.id, user.id, chips);
+    const result = await liveApi.leaveSession(
+      session.id,
+      user.id,
+      chips,
+      adjustPlan
+    );
     if (!result.success) {
       setLeaveError(result.error || 'Failed to leave table. Please try again.');
       return;
     }
-    setHasLeft(true);
+    setLeavePending(true);
+    setPendingOutChips(chips);
     setIsLeaving(false);
     setOutChips('');
+    setAdjustPlan(false);
   };
 
   const handleCancelLeave = async () => {
     if (!session) return;
-    await liveApi.rejectLeave(session.id, user.id);
-    refreshData();
+    const updated = await liveApi.rejectLeave(session.id, user.id);
+    if (updated) {
+      setLeavePending(false);
+      setPendingOutChips(undefined);
+    }
   };
 
   const handleRejoin = async () => {
     if (!session) return;
-    await liveApi.joinSession(session.sessionCode, user.id);
-    setHasLeft(false);
-    refreshData();
+    const result = await liveApi.joinSession(session.sessionCode, user.id);
+    if (result.success) {
+      setHasLeft(false);
+      await refreshData();
+    }
   };
 
   if (!session) {
@@ -111,6 +130,7 @@ export default function LiveSessionPlayer({ user, sessionCode, navigate }: Props
   }
 
   const isAdmin    = session.createdBy === user.id;
+  const currentPlayer = players.find((player) => player.userId === user.id);
   const totalApproved = buyIns
     .filter((b) => b.status === 'approved')
     .reduce((sum, b) => sum + b.amount, 0);
@@ -128,7 +148,39 @@ export default function LiveSessionPlayer({ user, sessionCode, navigate }: Props
           </span>
           Live Session • {session.blindValue} Blinds
         </div>
+        <div>
+          <button
+            onClick={refreshData}
+            className="inline-flex items-center gap-2 px-4 py-2 text-[10px] font-black text-slate-500 hover:text-white bg-slate-900 border border-slate-800 rounded-full transition-all"
+          >
+            <RefreshCw className="w-3 h-3" /> Refresh table
+          </button>
+        </div>
       </div>
+
+      <section className="bg-sky-500/5 border border-sky-500/20 p-6 rounded-[2rem] flex items-start gap-4">
+        <div className="w-11 h-11 rounded-xl bg-sky-500/10 text-sky-400 flex items-center justify-center shrink-0">
+          <CalendarClock className="w-5 h-5" />
+        </div>
+        <div className="space-y-1">
+          <p className="text-[10px] font-black uppercase tracking-widest text-sky-400">
+            Your Play Plan
+          </p>
+          <p className="text-lg font-black text-white">
+            {currentPlayer?.commitmentType === 'flexible'
+              ? 'Keeping it flexible'
+              : currentPlayer?.commitmentEndAt
+                ? `Play until ${new Date(currentPlayer.commitmentEndAt).toLocaleTimeString(
+                    [],
+                    { hour: '2-digit', minute: '2-digit' }
+                  )}`
+                : 'Needs review'}
+          </p>
+          <p className="text-[10px] text-slate-500">
+            This is for coordination, not pressure. You can leave whenever you need to.
+          </p>
+        </div>
+      </section>
 
       <div className="grid grid-cols-2 gap-4">
         <div className="bg-slate-900 p-8 rounded-[2rem] border border-slate-800 shadow-2xl text-center hover:border-emerald-500/40 transition-all">
@@ -168,6 +220,24 @@ export default function LiveSessionPlayer({ user, sessionCode, navigate }: Props
               onChange={(e) => setOutChips(e.target.value)}
             />
           </div>
+          {currentPlayer?.commitmentType !== 'flexible' && (
+            <label className="flex items-start gap-3 p-4 rounded-2xl bg-slate-900 border border-slate-800 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={adjustPlan}
+                onChange={(event) => setAdjustPlan(event.target.checked)}
+                className="mt-0.5 accent-amber-500"
+              />
+              <span>
+                <span className="block text-xs font-black text-slate-200">
+                  My plan changed for a legitimate reason
+                </span>
+                <span className="block text-[10px] text-slate-500 mt-1">
+                  The host will review this adjustment. No private explanation is required.
+                </span>
+              </span>
+            </label>
+          )}
           {leaveError && (
             <p className="text-rose-400 text-xs font-bold flex items-center gap-2">
               <AlertCircle className="w-4 h-4" /> {leaveError}

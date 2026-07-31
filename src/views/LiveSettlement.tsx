@@ -1,7 +1,25 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { liveApi, LiveUser, LiveSettlementTx } from '../services/liveApi';
+import {
+  liveApi,
+  LiveUser,
+  LiveSettlementTx,
+  LiveAttendanceEvent,
+} from '../services/liveApi';
 import { computePlayerResults, computeSettlements } from '../lib/settlement';
-import { ArrowRight, Trophy, Coins, CheckCircle2, Upload, Check } from 'lucide-react';
+import {
+  buildAttendanceIntervals,
+  PLAY_PLAN_LABELS,
+  scorePlayPlan,
+} from '../lib/playPlan';
+import {
+  ArrowRight,
+  Trophy,
+  Coins,
+  CheckCircle2,
+  Upload,
+  Check,
+  CalendarClock,
+} from 'lucide-react';
 
 interface Props {
   user: LiveUser;
@@ -14,7 +32,8 @@ export default function LiveSettlement({ user, sessionId, navigate }: Props) {
     session: any;
     players: any[];
     buyIns: any[];
-  }>({ session: null, players: [], buyIns: [] });
+    attendanceEvents: LiveAttendanceEvent[];
+  }>({ session: null, players: [], buyIns: [], attendanceEvents: [] });
   const [publishState, setPublishState] = useState<'idle' | 'loading' | 'done'>('idle');
   const [publishError, setPublishError] = useState<string | null>(null);
 
@@ -26,6 +45,7 @@ export default function LiveSettlement({ user, sessionId, navigate }: Props) {
           session: result.session,
           players: result.players,
           buyIns: result.buyIns.filter((b) => b.status === 'approved'),
+          attendanceEvents: result.attendanceEvents,
         });
         if (result.session.publishedToLedger) setPublishState('done');
       }
@@ -38,7 +58,7 @@ export default function LiveSettlement({ user, sessionId, navigate }: Props) {
     setPublishError(null);
     setPublishState('loading');
     const result = await liveApi.publishToLedger(data.session.id);
-    if (result.success) {
+    if (result.success === true) {
       setPublishState('done');
       setData((d) => ({
         ...d,
@@ -62,6 +82,29 @@ export default function LiveSettlement({ user, sessionId, navigate }: Props) {
     [results]
   );
 
+  const planRecap = useMemo(
+    () =>
+      data.players.map((player) => ({
+        player,
+        score: scorePlayPlan({
+          commitmentType: player.commitmentType,
+          commitmentStartAt: player.commitmentStartAt,
+          commitmentEndAt: player.commitmentEndAt,
+          sessionStartAt: data.session?.createdAt,
+          sessionEndAt: data.session?.closedAt,
+          attendance: buildAttendanceIntervals(
+            data.attendanceEvents,
+            player.userId,
+            data.session?.closedAt,
+            player.joinedAt,
+            player.leftAt
+          ),
+          adjusted: player.commitmentAdjusted,
+        }),
+      })),
+    [data.attendanceEvents, data.players, data.session]
+  );
+
   if (!data.session) {
     return (
       <div className="text-center py-20 text-slate-500">
@@ -80,6 +123,55 @@ export default function LiveSettlement({ user, sessionId, navigate }: Props) {
         <h1 className="text-3xl font-black text-white">{data.session.name} — Final</h1>
         <p className="text-slate-500">Results and settlement instructions</p>
       </div>
+
+      <section className="bg-sky-500/5 border border-sky-500/20 rounded-3xl overflow-hidden shadow-2xl">
+        <div className="px-6 py-4 border-b border-sky-500/10 flex items-center justify-between gap-4">
+          <h2 className="text-xs font-bold text-sky-400 uppercase tracking-widest flex items-center gap-2">
+            <CalendarClock className="w-4 h-4" /> Play Plan recap
+          </h2>
+          <span className="text-[9px] font-black text-slate-500 uppercase">
+            Separate from winnings
+          </span>
+        </div>
+        <div className="divide-y divide-sky-500/10">
+          {planRecap.map(({ player, score }) => {
+            const statusColor =
+              score.status === 'on_plan' || score.status === 'plan_changed'
+                ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20'
+                : score.status === 'mostly_on_plan' || score.status === 'in_progress'
+                  ? 'text-amber-400 bg-amber-500/10 border-amber-500/20'
+                  : score.status === 'incomplete'
+                    ? 'text-rose-400 bg-rose-500/10 border-rose-500/20'
+                    : 'text-slate-400 bg-slate-800 border-slate-700';
+            return (
+              <div
+                key={player.userId}
+                className="px-6 py-5 flex items-center justify-between gap-4"
+              >
+                <div>
+                  <p className="font-black text-white">{player.name}</p>
+                  <p className="text-[10px] text-slate-500 mt-1">
+                    {score.status === 'flexible' || score.status === 'needs_review'
+                      ? 'No scored commitment'
+                      : `${Math.round(score.attendedMinutes)} of ${Math.round(
+                          score.plannedMinutes
+                        )} planned minutes`}
+                  </p>
+                </div>
+                <span
+                  className={`px-3 py-1.5 rounded-full border text-[9px] font-black uppercase tracking-wider ${statusColor}`}
+                >
+                  {PLAY_PLAN_LABELS[score.status]}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        <p className="px-6 py-4 text-[10px] text-slate-500 border-t border-sky-500/10">
+          Plans are coordination promises only. Profit, loss, buy-ins and rebuys never affect
+          these statuses.
+        </p>
+      </section>
 
       {/* Performance Ledger */}
       <section className="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl">

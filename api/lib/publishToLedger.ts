@@ -37,8 +37,8 @@ export type PublishValidationError =
   | { code: 'missing_winnings'; message: string };
 
 export type PublishValidation =
-  | { ok: true; payload: FishesSessionPayload }
-  | { ok: false; error: PublishValidationError };
+  | { ok: true; payload: FishesSessionPayload; error?: never }
+  | { ok: false; error: PublishValidationError; payload?: never };
 
 const KOLKATA_OFFSET_MIN = 5 * 60 + 30;
 

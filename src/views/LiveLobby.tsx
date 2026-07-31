@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { liveApi, LiveUser, LiveSession, LivePlayerStats, LiveSessionPLPoint } from '../services/liveApi';
+import type { CommitmentType } from '../lib/playPlan';
 import { computeCumulative, computeScale, xFor as xForAt, yFor as yForAt } from '../lib/plChart';
 import {
   PlusCircle, Key, History, TrendingUp, LayoutDashboard,
@@ -79,7 +80,12 @@ export default function LiveLobby({ user, onLogout, navigate, initialCode }: Liv
   );
   const [sessionName, setSessionName] = useState('');
   const [blindValue, setBlindValue] = useState('10/20');
+  const [plannedDuration, setPlannedDuration] = useState(240);
+  const [hostPlan, setHostPlan] = useState<CommitmentType>('full');
+  const [hostPlanMinutes, setHostPlanMinutes] = useState(120);
   const [joinCode, setJoinCode] = useState(initialCode || '');
+  const [joinPlan, setJoinPlan] = useState<CommitmentType>('full');
+  const [joinPlanMinutes, setJoinPlanMinutes] = useState(120);
   const [joinError, setJoinError] = useState('');
   const [createError, setCreateError] = useState('');
   const [history, setHistory] = useState<LiveSession[]>([]);
@@ -89,12 +95,10 @@ export default function LiveLobby({ user, onLogout, navigate, initialCode }: Liv
 
   useEffect(() => {
     const load = async () => {
-      const [sessions, s] = await Promise.all([
-        liveApi.getSessions(user.id),
-        liveApi.getUserStats(user.id),
-      ]);
-      setHistory(sessions);
-      setStats(s);
+      const lobby = await liveApi.getLobby(user.id);
+      if (!lobby) return;
+      setHistory(lobby.sessions);
+      setStats(lobby.stats);
     };
     load();
   }, [user.id]);
@@ -103,7 +107,14 @@ export default function LiveLobby({ user, onLogout, navigate, initialCode }: Liv
     e.preventDefault();
     if (!sessionName) return;
     setCreateError('');
-    const result = await liveApi.createSession(sessionName, blindValue, user.id);
+    const result = await liveApi.createSession(
+      sessionName,
+      blindValue,
+      user.id,
+      plannedDuration,
+      hostPlan,
+      hostPlan === 'custom' ? hostPlanMinutes : undefined
+    );
     if (result.success && result.session) {
       navigate(`admin/${result.session.sessionCode}`);
     } else {
@@ -114,13 +125,18 @@ export default function LiveLobby({ user, onLogout, navigate, initialCode }: Liv
   const handleJoin = async (e: React.FormEvent) => {
     e.preventDefault();
     setJoinError('');
-    const result = await liveApi.joinSession(joinCode, user.id);
-    if (result.success && result.sessionId) {
-      const sessionData = await liveApi.getSession(result.sessionId);
-      if (sessionData && sessionData.session.createdBy === user.id) {
-        navigate(`admin/${sessionData.session.sessionCode}`);
-      } else if (sessionData) {
-        navigate(`player/${sessionData.session.sessionCode}`);
+    const result = await liveApi.joinSession(
+      joinCode,
+      user.id,
+      'player',
+      joinPlan,
+      joinPlan === 'custom' ? joinPlanMinutes : undefined
+    );
+    if (result.success && result.session) {
+      if (result.session.createdBy === user.id) {
+        navigate(`admin/${result.session.sessionCode}`);
+      } else {
+        navigate(`player/${result.session.sessionCode}`);
       }
     } else {
       setJoinError(result.error || 'Failed to join table.');
@@ -168,7 +184,7 @@ export default function LiveLobby({ user, onLogout, navigate, initialCode }: Liv
           </h2>
           <div className="flex items-center gap-1.5">
             <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.8)]" />
-            <span className="text-[9px] font-bold text-emerald-500/80 uppercase">Live Sync</span>
+            <span className="text-[9px] font-bold text-emerald-500/80 uppercase">On-demand sync</span>
           </div>
         </div>
         <div className="grid grid-cols-2 gap-3">
@@ -306,6 +322,62 @@ export default function LiveLobby({ user, onLogout, navigate, initialCode }: Liv
               </div>
               <div className="space-y-1.5">
                 <label className="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] ml-1">
+                  Expected Table Time
+                </label>
+                <select
+                  value={plannedDuration}
+                  onChange={(event) => setPlannedDuration(Number(event.target.value))}
+                  className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 focus:ring-2 focus:ring-emerald-500/50 outline-none font-bold text-white"
+                >
+                  <option value={120}>2 hours</option>
+                  <option value={180}>3 hours</option>
+                  <option value={240}>4 hours</option>
+                  <option value={300}>5 hours</option>
+                  <option value={360}>6 hours</option>
+                </select>
+              </div>
+              <div className="space-y-3">
+                <label className="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] ml-1">
+                  Your Play Plan
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  {([
+                    ['full', 'Full session'],
+                    ['custom', 'Set duration'],
+                    ['flexible', 'Flexible'],
+                  ] as const).map(([value, label]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => setHostPlan(value)}
+                      className={`rounded-xl px-3 py-3 text-[10px] font-black transition-all border ${
+                        hostPlan === value
+                          ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-400'
+                          : 'bg-black/30 border-white/5 text-slate-500'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {hostPlan === 'custom' && (
+                  <select
+                    value={hostPlanMinutes}
+                    onChange={(event) => setHostPlanMinutes(Number(event.target.value))}
+                    className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-white font-bold"
+                  >
+                    <option value={60}>1 hour</option>
+                    <option value={120}>2 hours</option>
+                    <option value={180}>3 hours</option>
+                    <option value={240}>4 hours</option>
+                  </select>
+                )}
+                <p className="text-[10px] text-slate-500 leading-relaxed">
+                  Plans help the group coordinate. They never require anyone to keep playing or rebuy.
+                </p>
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] ml-1">
                   Table Blinds
                 </label>
                 <input
@@ -351,6 +423,46 @@ export default function LiveLobby({ user, onLogout, navigate, initialCode }: Liv
                   setJoinError('');
                 }}
               />
+              <div className="space-y-3 text-left">
+                <div>
+                  <h3 className="text-sm font-black text-white">How long are you planning to play?</h3>
+                  <p className="text-[10px] text-slate-500 mt-1">
+                    Choose freely. You can always leave when you need to.
+                  </p>
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  {([
+                    ['full', 'Full session'],
+                    ['custom', 'Set duration'],
+                    ['flexible', 'Flexible'],
+                  ] as const).map(([value, label]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => setJoinPlan(value)}
+                      className={`rounded-xl px-2 py-3 text-[10px] font-black border transition-all ${
+                        joinPlan === value
+                          ? 'bg-amber-500/15 border-amber-500/40 text-amber-400'
+                          : 'bg-black/30 border-white/5 text-slate-500'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {joinPlan === 'custom' && (
+                  <select
+                    value={joinPlanMinutes}
+                    onChange={(event) => setJoinPlanMinutes(Number(event.target.value))}
+                    className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-white font-bold"
+                  >
+                    <option value={60}>1 hour from joining</option>
+                    <option value={120}>2 hours from joining</option>
+                    <option value={180}>3 hours from joining</option>
+                    <option value={240}>4 hours from joining</option>
+                  </select>
+                )}
+              </div>
               {joinError && (
                 <p className="text-rose-400 text-[10px] font-black uppercase tracking-widest">
                   {joinError}

@@ -1,5 +1,6 @@
 import express from "express";
 import { Pool } from "pg";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import {
@@ -13,6 +14,12 @@ import {
   SessionResultRow,
   SettlementRow,
 } from "./lib/playerHistory.js";
+import {
+  calculatePokerNowResults,
+  parsePokerNowGameUrl,
+  parsePokerNowLedger,
+  type PokerNowLedgerPlayer,
+} from "./lib/pokerNow.js";
 
 dotenv.config();
 
@@ -52,6 +59,10 @@ const initDB = async () => {
   let client;
   try {
     client = await pool.connect();
+    await client.query("BEGIN");
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtext('poker-fishes-ledger-schema-v1'))"
+    );
     // ── Fishes tables (existing) ────────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS players (
@@ -62,7 +73,8 @@ const initDB = async () => {
       CREATE TABLE IF NOT EXISTS sessions (
         id   SERIAL PRIMARY KEY,
         date TEXT NOT NULL,
-        note TEXT
+        note TEXT,
+        attendance JSONB NOT NULL DEFAULT '[]'::jsonb
       );
 
       CREATE TABLE IF NOT EXISTS session_results (
@@ -88,6 +100,30 @@ const initDB = async () => {
       );
 
       ALTER TABLE settlements ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'completed';
+      ALTER TABLE sessions ADD COLUMN IF NOT EXISTS attendance JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+      CREATE TABLE IF NOT EXISTS poker_now_trackers (
+        id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        game_id      TEXT NOT NULL,
+        game_url     TEXT NOT NULL,
+        note         TEXT,
+        status       TEXT NOT NULL DEFAULT 'active'
+                     CHECK (status IN ('active', 'closed')),
+        baseline     JSONB NOT NULL,
+        cents_mode   BOOLEAN NOT NULL DEFAULT FALSE,
+        access_token_hash TEXT,
+        final_ledger JSONB,
+        attendance   JSONB NOT NULL DEFAULT '[]'::jsonb,
+        session_id   INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+        started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        ended_at     TIMESTAMPTZ
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_poker_now_active_game
+        ON poker_now_trackers(game_id) WHERE status = 'active';
+      ALTER TABLE poker_now_trackers
+        ADD COLUMN IF NOT EXISTS cents_mode BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS access_token_hash TEXT;
     `);
 
     // ── Live (Thor) tables (new) ────────────────────────────────────────────
@@ -98,8 +134,10 @@ const initDB = async () => {
         username   TEXT        NOT NULL UNIQUE,
         password   TEXT        NOT NULL,
         mobile     TEXT,
+        auth_token_hash TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
+      ALTER TABLE live_users ADD COLUMN IF NOT EXISTS auth_token_hash TEXT;
 
       CREATE TABLE IF NOT EXISTS live_sessions (
         id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -131,35 +169,120 @@ const initDB = async () => {
                    CHECK (status IN ('pending','approved','rejected')),
         timestamp  TIMESTAMPTZ DEFAULT NOW()
       );
+      DO $migration$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conrelid = 'live_buy_ins'::regclass
+            AND conname = 'live_buy_ins_amount_valid'
+        ) THEN
+          ALTER TABLE live_buy_ins
+            ADD CONSTRAINT live_buy_ins_amount_valid
+            CHECK (
+              amount > 0
+              AND amount <= 1000000000
+              AND amount <> 'NaN'::numeric
+            ) NOT VALID;
+        END IF;
+      END
+      $migration$;
 
       ALTER TABLE live_sessions
         ADD COLUMN IF NOT EXISTS published_to_ledger  BOOLEAN NOT NULL DEFAULT FALSE,
-        ADD COLUMN IF NOT EXISTS published_session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL;
+        ADD COLUMN IF NOT EXISTS published_session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+        ADD COLUMN IF NOT EXISTS planned_end_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS end_reason TEXT;
 
       ALTER TABLE live_session_players
         ADD COLUMN IF NOT EXISTS left_at TIMESTAMPTZ,
         ADD COLUMN IF NOT EXISTS leave_pending BOOLEAN NOT NULL DEFAULT FALSE,
-        ADD COLUMN IF NOT EXISTS pending_out_chips NUMERIC;
+        ADD COLUMN IF NOT EXISTS pending_out_chips NUMERIC,
+        ADD COLUMN IF NOT EXISTS joined_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS commitment_type TEXT NOT NULL DEFAULT 'flexible',
+        ADD COLUMN IF NOT EXISTS commitment_start_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS commitment_end_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS commitment_locked_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS commitment_adjusted BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS pending_plan_adjustment BOOLEAN NOT NULL DEFAULT FALSE;
+
+      UPDATE live_session_players lsp
+      SET joined_at = ls.created_at
+      FROM live_sessions ls
+      WHERE lsp.session_id = ls.id AND lsp.joined_at IS NULL;
+
+      ALTER TABLE live_session_players ALTER COLUMN joined_at SET DEFAULT NOW();
+
+      CREATE TABLE IF NOT EXISTS live_attendance_events (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        session_id  UUID NOT NULL REFERENCES live_sessions(id) ON DELETE CASCADE,
+        user_id     UUID NOT NULL REFERENCES live_users(id) ON DELETE CASCADE,
+        event_type  TEXT NOT NULL CHECK (event_type IN ('join', 'rejoin', 'leave', 'pause', 'resume')),
+        occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      DO $migration$
+      BEGIN
+        IF EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conrelid = 'live_attendance_events'::regclass
+            AND conname = 'live_attendance_events_event_type_check'
+            AND pg_get_constraintdef(oid) NOT LIKE '%pause%'
+        ) THEN
+          ALTER TABLE live_attendance_events
+            DROP CONSTRAINT live_attendance_events_event_type_check;
+          ALTER TABLE live_attendance_events
+            ADD CONSTRAINT live_attendance_events_event_type_check
+            CHECK (event_type IN ('join', 'rejoin', 'leave', 'pause', 'resume'));
+        END IF;
+      END
+      $migration$;
 
       CREATE INDEX IF NOT EXISTS idx_live_sessions_code   ON live_sessions(session_code);
       CREATE INDEX IF NOT EXISTS idx_live_buy_ins_session ON live_buy_ins(session_id);
       CREATE INDEX IF NOT EXISTS idx_live_sp_session      ON live_session_players(session_id);
       CREATE INDEX IF NOT EXISTS idx_live_sp_user         ON live_session_players(user_id);
+      CREATE INDEX IF NOT EXISTS idx_live_attendance_session
+        ON live_attendance_events(session_id, occurred_at);
     `);
+    await client.query("COMMIT");
     console.log("[db] initDB ok — schema verified");
   } catch (err) {
-    // Keep the server process alive even when Postgres is unreachable at
-    // boot. Routes that need the DB will still fail with 503s, but at least
-    // the static SPA loads and the user sees a degraded UI instead of a
-    // blank page.
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // The original initialization error is the actionable failure.
+      }
+    }
     console.error("[db] initDB failed — server will stay up, API calls will fail until DB is reachable:", err instanceof Error ? err.message : err);
+    throw err;
   } finally {
     if (client) client.release();
   }
 };
 
-// Don't await — initDB failures must not keep the HTTP server from binding.
-initDB().catch((err) => console.error("[db] initDB rejected:", err));
+let initDBPromise: Promise<void> | null = null;
+
+function ensureDatabaseInitialized() {
+  if (!initDBPromise) {
+    initDBPromise = initDB().catch((error) => {
+      initDBPromise = null;
+      throw error;
+    });
+  }
+  return initDBPromise;
+}
+
+app.use(async (_req, res, next) => {
+  try {
+    await ensureDatabaseInitialized();
+    next();
+  } catch {
+    res.status(503).json({ error: "Database initialization failed" });
+  }
+});
 
 // ===========================================================================
 // ── FISHES ROUTES (unchanged) ───────────────────────────────────────────────
@@ -176,20 +299,469 @@ async function resolvePlayerName(client: any, name: string): Promise<string> {
   return res.rows.length > 0 ? res.rows[0].name : name.trim();
 }
 
+type UploadedAttendance = {
+  externalId: string;
+  name: string;
+  joinedAt: string;
+  leftAt: string;
+  durationMinutes: number;
+  handCount: number;
+  confidence: "high" | "medium";
+};
+
+async function fetchPokerNowLedger(gameId: string): Promise<PokerNowLedgerPlayer[]> {
+  const response = await fetch(
+    `https://www.pokernow.com/games/${encodeURIComponent(gameId)}/players_sessions`,
+    {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(12_000),
+    }
+  );
+  if (!response.ok) {
+    throw new Error(
+      response.status === 404
+        ? "PokerNow game was not found or is not accessible"
+        : `PokerNow ledger request failed (${response.status})`
+    );
+  }
+  return parsePokerNowLedger(await response.json());
+}
+
+async function fetchPokerNowCentsMode(gameId: string): Promise<boolean> {
+  const response = await fetch(
+    `https://www.pokernow.com/games/${encodeURIComponent(gameId)}/current_or_next_configs`,
+    {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(12_000),
+    }
+  );
+  if (!response.ok) {
+    throw new Error(`PokerNow configuration request failed (${response.status})`);
+  }
+  const config = (await response.json()) as { cM?: unknown };
+  return config.cM === true;
+}
+
+function hashAccessToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function readBearerToken(req: any): string | null {
+  const authorization =
+    typeof req.headers.authorization === "string" ? req.headers.authorization : "";
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() || null;
+}
+
+function accessTokenMatches(token: string | null, expectedHash: unknown): boolean {
+  if (!token || typeof expectedHash !== "string") return false;
+  const actual = Buffer.from(hashAccessToken(token), "hex");
+  const expected = Buffer.from(expectedHash, "hex");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function mapPokerNowTracker(row: any) {
+  return {
+    id: row.id,
+    gameId: row.game_id,
+    gameUrl: row.game_url,
+    note: row.note ?? "",
+    status: row.status,
+    startedAt: new Date(row.started_at).getTime(),
+    endedAt: row.ended_at ? new Date(row.ended_at).getTime() : undefined,
+    sessionId: row.session_id == null ? null : Number(row.session_id),
+  };
+}
+
+function normalizeUploadedAttendance(value: unknown): UploadedAttendance[] {
+  if (value == null) return [];
+  if (!Array.isArray(value) || value.length > 100) {
+    throw new Error("attendance must be an array with at most 100 players");
+  }
+
+  return value.map((entry, index) => {
+    if (!entry || typeof entry !== "object") {
+      throw new Error(`attendance[${index}] must be an object`);
+    }
+    const item = entry as Record<string, unknown>;
+    const externalId = typeof item.externalId === "string" ? item.externalId.trim() : "";
+    const name = typeof item.name === "string" ? item.name.trim() : "";
+    const joinedAt = typeof item.joinedAt === "string" ? item.joinedAt : "";
+    const leftAt = typeof item.leftAt === "string" ? item.leftAt : "";
+    const durationMinutes = Number(item.durationMinutes);
+    const handCount = Number(item.handCount);
+    const confidence = item.confidence;
+
+    if (!externalId || externalId.length > 100 || !name || name.length > 100) {
+      throw new Error(`attendance[${index}] has an invalid player identity`);
+    }
+    if (
+      !Number.isFinite(Date.parse(joinedAt)) ||
+      !Number.isFinite(Date.parse(leftAt)) ||
+      Date.parse(leftAt) < Date.parse(joinedAt)
+    ) {
+      throw new Error(`attendance[${index}] has invalid timestamps`);
+    }
+    if (!Number.isFinite(durationMinutes) || durationMinutes < 0 || durationMinutes > 1440) {
+      throw new Error(`attendance[${index}] has an invalid duration`);
+    }
+    if (!Number.isInteger(handCount) || handCount < 1 || handCount > 100000) {
+      throw new Error(`attendance[${index}] has an invalid hand count`);
+    }
+    if (confidence !== "high" && confidence !== "medium") {
+      throw new Error(`attendance[${index}] has an invalid confidence`);
+    }
+
+    return {
+      externalId,
+      name,
+      joinedAt,
+      leftAt,
+      durationMinutes,
+      handCount,
+      confidence,
+    };
+  });
+}
+
+const PLAYERS_QUERY = `
+  SELECT
+    p.id,
+    p.name,
+    (
+      COALESCE((SELECT SUM(amount) FROM session_results WHERE player_id = p.id), 0)
+      + COALESCE((SELECT SUM(amount) FROM settlements WHERE payer_id = p.id AND status = 'completed'), 0)
+      - COALESCE((SELECT SUM(amount) FROM settlements WHERE payee_id = p.id AND status = 'completed'), 0)
+    ) AS total_profit
+  FROM players p
+  ORDER BY total_profit DESC
+`;
+
+const SESSIONS_QUERY = `
+  SELECT s.id, s.date, s.note, s.attendance,
+         COALESCE(
+           json_agg(
+             json_build_object('name', p.name, 'amount', sr.amount)
+           ) FILTER (WHERE sr.id IS NOT NULL),
+           '[]'
+         ) AS results
+  FROM sessions s
+  LEFT JOIN session_results sr ON sr.session_id = s.id
+  LEFT JOIN players p ON sr.player_id = p.id
+  GROUP BY s.id
+  ORDER BY s.date DESC
+`;
+
+const SETTLEMENTS_QUERY = `
+  SELECT s.id, s.amount, s.date, s.status,
+         p1.name AS payer, p2.name AS payee
+  FROM settlements s
+  JOIN players p1 ON s.payer_id = p1.id
+  JOIN players p2 ON s.payee_id = p2.id
+  ORDER BY s.date DESC, s.id DESC
+`;
+
+const PLAYER_ALIASES_QUERY = `
+  SELECT p.id, p.name,
+    COALESCE(
+      json_agg(json_build_object('id', pa.id, 'alias', pa.alias))
+      FILTER (WHERE pa.id IS NOT NULL), '[]'
+    ) AS aliases,
+    COALESCE((SELECT SUM(sr.amount) FROM session_results sr WHERE sr.player_id = p.id), 0) AS session_profit
+  FROM players p
+  LEFT JOIN player_aliases pa ON pa.player_id = p.id
+  GROUP BY p.id
+  ORDER BY p.name
+`;
+
+app.get("/api/bootstrap", async (_req, res) => {
+  try {
+    const [players, sessions, settlements, playersWithAliases] = await Promise.all([
+      pool.query(PLAYERS_QUERY),
+      pool.query(SESSIONS_QUERY),
+      pool.query(SETTLEMENTS_QUERY),
+      pool.query(PLAYER_ALIASES_QUERY),
+    ]);
+    res.json({
+      players: players.rows,
+      sessions: sessions.rows,
+      settlements: settlements.rows,
+      playersWithAliases: playersWithAliases.rows,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to load application data" });
+  }
+});
+
+async function getPokerNowFinalizedSession(db: any, tracker: any) {
+  if (tracker.session_id == null) return null;
+  const result = await db.query(
+    `SELECT s.id, s.date, s.note, s.attendance,
+            COALESCE(
+              json_agg(json_build_object('name', p.name, 'amount', sr.amount))
+                FILTER (WHERE sr.id IS NOT NULL),
+              '[]'
+            ) AS results
+     FROM sessions s
+     LEFT JOIN session_results sr ON sr.session_id = s.id
+     LEFT JOIN players p ON p.id = sr.player_id
+     WHERE s.id = $1
+     GROUP BY s.id`,
+    [tracker.session_id]
+  );
+  return result.rows[0] ?? null;
+}
+
+app.post("/api/pokernow/start", async (req, res) => {
+  let parsed: { gameId: string; gameUrl: string };
+  try {
+    parsed = parsePokerNowGameUrl(req.body.url);
+  } catch (error) {
+    return res.status(400).json({
+      error: error instanceof Error ? error.message : "Invalid PokerNow link",
+    });
+  }
+  const note = typeof req.body.note === "string" ? req.body.note.trim().slice(0, 200) : "";
+  const accessToken =
+    typeof req.body.accessToken === "string" ? req.body.accessToken.trim() : "";
+  if (accessToken.length < 32 || accessToken.length > 200) {
+    return res.status(400).json({ error: "A valid tracker access token is required" });
+  }
+  const accessTokenHash = hashAccessToken(accessToken);
+
+  try {
+    const existing = await pool.query(
+      `SELECT id, game_id, game_url, note, status, started_at, ended_at, session_id,
+              access_token_hash
+       FROM poker_now_trackers
+       WHERE game_id = $1 AND status = 'active'`,
+      [parsed.gameId]
+    );
+    if (existing.rows.length > 0) {
+      if (!accessTokenMatches(accessToken, existing.rows[0].access_token_hash)) {
+        return res.status(409).json({
+          error: "This PokerNow game is already being tracked on another device",
+        });
+      }
+      return res.json({ tracker: mapPokerNowTracker(existing.rows[0]), alreadyStarted: true });
+    }
+
+    const [baseline, centsMode] = await Promise.all([
+      fetchPokerNowLedger(parsed.gameId),
+      fetchPokerNowCentsMode(parsed.gameId),
+    ]);
+    const result = await pool.query(
+      `INSERT INTO poker_now_trackers
+         (game_id, game_url, note, baseline, cents_mode, access_token_hash)
+       VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+       ON CONFLICT (game_id) WHERE status = 'active' DO NOTHING
+       RETURNING id, game_id, game_url, note, status, started_at, ended_at, session_id`,
+      [
+        parsed.gameId,
+        parsed.gameUrl,
+        note,
+        JSON.stringify(baseline),
+        centsMode,
+        accessTokenHash,
+      ]
+    );
+    if (result.rows.length === 0) {
+      const raced = await pool.query(
+        `SELECT id, game_id, game_url, note, status, started_at, ended_at, session_id,
+                access_token_hash
+         FROM poker_now_trackers
+         WHERE game_id = $1 AND status = 'active'`,
+        [parsed.gameId]
+      );
+      if (
+        raced.rows.length === 0 ||
+        !accessTokenMatches(accessToken, raced.rows[0].access_token_hash)
+      ) {
+        return res.status(409).json({
+          error: "This PokerNow game is already being tracked on another device",
+        });
+      }
+      return res.json({ tracker: mapPokerNowTracker(raced.rows[0]), alreadyStarted: true });
+    }
+    res.status(201).json({ tracker: mapPokerNowTracker(result.rows[0]) });
+  } catch (error) {
+    console.error(error);
+    res.status(502).json({
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not start PokerNow tracking",
+    });
+  }
+});
+
+app.post("/api/pokernow/:id/finalize", async (req, res) => {
+  const { id } = req.params;
+  if (!UUID_PATTERN.test(id)) {
+    return res.status(400).json({ error: "Invalid PokerNow tracker id" });
+  }
+  let attendance: UploadedAttendance[];
+  try {
+    attendance = normalizeUploadedAttendance(req.body.attendance);
+  } catch (error) {
+    return res.status(400).json({
+      error: error instanceof Error ? error.message : "Invalid attendance",
+    });
+  }
+  if (attendance.length === 0) {
+    return res.status(400).json({ error: "Upload a PokerNow Game Log before finalizing" });
+  }
+
+  const trackerRes = await pool.query(
+    "SELECT * FROM poker_now_trackers WHERE id = $1",
+    [id]
+  );
+  if (trackerRes.rows.length === 0) {
+    return res.status(404).json({ error: "PokerNow tracker not found" });
+  }
+  const tracker = trackerRes.rows[0];
+  if (!accessTokenMatches(readBearerToken(req), tracker.access_token_hash)) {
+    return res.status(401).json({ error: "Invalid PokerNow tracker access token" });
+  }
+  if (tracker.status === "closed") {
+    const session = await getPokerNowFinalizedSession(pool, tracker);
+    return session
+      ? res.json({ tracker: mapPokerNowTracker(tracker), session })
+      : res.status(409).json({ error: "This PokerNow session is already finalized" });
+  }
+
+  let finalLedger: PokerNowLedgerPlayer[];
+  try {
+    finalLedger = await fetchPokerNowLedger(tracker.game_id);
+  } catch (error) {
+    console.error(error);
+    return res.status(502).json({
+      error:
+        error instanceof Error
+          ? `${error.message}. Upload a ledger file as a fallback.`
+          : "Could not fetch the PokerNow ledger",
+    });
+  }
+
+  const baseline: PokerNowLedgerPlayer[] = Array.isArray(tracker.baseline)
+    ? tracker.baseline
+    : [];
+  const startedAt = new Date(tracker.started_at).getTime();
+  const endedAt = Date.now();
+  if (
+    attendance.some(
+      (entry) =>
+        Date.parse(entry.joinedAt) < startedAt - 1000 ||
+        Date.parse(entry.leftAt) > endedAt + 60_000
+    )
+  ) {
+    return res.status(400).json({
+      error: "The Game Log includes hands outside this tracked session. Re-import it from the active tracker.",
+    });
+  }
+
+  const results = calculatePokerNowResults(
+    baseline,
+    finalLedger,
+    attendance,
+    tracker.cents_mode === true
+  );
+  if (results.length === 0) {
+    return res.status(422).json({ error: "No PokerNow players were found" });
+  }
+
+  const date = new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10);
+  const note = tracker.note || `PokerNow ${tracker.game_id}`;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query(
+      "SELECT * FROM poker_now_trackers WHERE id = $1 FOR UPDATE",
+      [id]
+    );
+    if (locked.rows[0].status !== "active") {
+      const session = await getPokerNowFinalizedSession(client, locked.rows[0]);
+      await client.query("COMMIT");
+      return session
+        ? res.json({ tracker: mapPokerNowTracker(locked.rows[0]), session })
+        : res.status(409).json({ error: "This PokerNow session is already finalized" });
+    }
+    const sessionRes = await client.query(
+      `INSERT INTO sessions (date, note, attendance)
+       VALUES ($1, $2, $3::jsonb)
+       RETURNING id`,
+      [date, note, JSON.stringify(attendance)]
+    );
+    const sessionId = Number(sessionRes.rows[0].id);
+    await client.query(
+      `WITH input AS (
+         SELECT *
+         FROM jsonb_to_recordset($1::jsonb) AS item(name TEXT, amount NUMERIC)
+       ), resolved AS (
+         SELECT
+           COALESCE((
+             SELECT p.name
+             FROM player_aliases pa
+             JOIN players p ON p.id = pa.player_id
+             WHERE LOWER(pa.alias) = LOWER(TRIM(input.name))
+             LIMIT 1
+           ), TRIM(input.name)) AS name,
+           amount
+         FROM input
+       ), totals AS (
+         SELECT name, SUM(amount) AS amount
+         FROM resolved
+         GROUP BY name
+       ), upserted AS (
+         INSERT INTO players (name)
+         SELECT name FROM totals
+         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id, name
+       )
+       INSERT INTO session_results (session_id, player_id, amount)
+       SELECT $2, upserted.id, totals.amount
+       FROM totals
+       JOIN upserted USING (name)`,
+      [JSON.stringify(results), sessionId]
+    );
+    await client.query(
+      `UPDATE poker_now_trackers
+       SET status = 'closed', ended_at = NOW(), final_ledger = $1::jsonb,
+           attendance = $2::jsonb, session_id = $3
+       WHERE id = $4`,
+      [JSON.stringify(finalLedger), JSON.stringify(attendance), sessionId, id]
+    );
+    await client.query("COMMIT");
+    res.json({
+      tracker: {
+        ...mapPokerNowTracker({
+          ...tracker,
+          status: "closed",
+          ended_at: new Date(),
+          session_id: sessionId,
+        }),
+      },
+      session: {
+        id: sessionId,
+        date,
+        note,
+        attendance,
+        results: results.map(({ name, amount }) => ({ name, amount })),
+      },
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    res.status(500).json({ error: "Failed to finalize PokerNow session" });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/api/players", async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT
-        p.id,
-        p.name,
-        (
-          COALESCE((SELECT SUM(amount) FROM session_results WHERE player_id = p.id), 0)
-          + COALESCE((SELECT SUM(amount) FROM settlements WHERE payer_id = p.id AND status = 'completed'), 0)
-          - COALESCE((SELECT SUM(amount) FROM settlements WHERE payee_id = p.id AND status = 'completed'), 0)
-        ) AS total_profit
-      FROM players p
-      ORDER BY total_profit DESC
-    `);
+    const { rows } = await pool.query(PLAYERS_QUERY);
     res.json(rows);
   } catch (error) {
     console.error(error);
@@ -266,20 +838,7 @@ app.get("/api/players/:id/history", async (req, res) => {
 
 app.get("/api/sessions", async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT s.id, s.date, s.note,
-             COALESCE(
-               json_agg(
-                 json_build_object('name', p.name, 'amount', sr.amount)
-               ) FILTER (WHERE sr.id IS NOT NULL),
-               '[]'
-             ) AS results
-      FROM sessions s
-      LEFT JOIN session_results sr ON sr.session_id = s.id
-      LEFT JOIN players p ON sr.player_id = p.id
-      GROUP BY s.id
-      ORDER BY s.date DESC
-    `);
+    const { rows } = await pool.query(SESSIONS_QUERY);
     res.json(rows);
   } catch (error) {
     console.error(error);
@@ -289,12 +848,20 @@ app.get("/api/sessions", async (req, res) => {
 
 app.post("/api/sessions", async (req, res) => {
   const { date, note, results } = req.body;
+  let attendance: UploadedAttendance[];
+  try {
+    attendance = normalizeUploadedAttendance(req.body.attendance);
+  } catch (error) {
+    return res.status(400).json({
+      error: error instanceof Error ? error.message : "Invalid attendance",
+    });
+  }
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const sessionRes = await client.query(
-      "INSERT INTO sessions (date, note) VALUES ($1, $2) RETURNING id",
-      [date, note]
+      "INSERT INTO sessions (date, note, attendance) VALUES ($1, $2, $3::jsonb) RETURNING id",
+      [date, note, JSON.stringify(attendance)]
     );
     const sessionId = sessionRes.rows[0].id;
     for (const result of results) {
@@ -338,14 +905,7 @@ app.delete("/api/sessions/:id", async (req, res) => {
 
 app.get("/api/settlements", async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT s.id, s.amount, s.date, s.status,
-             p1.name AS payer, p2.name AS payee
-      FROM settlements s
-      JOIN players p1 ON s.payer_id = p1.id
-      JOIN players p2 ON s.payee_id = p2.id
-      ORDER BY s.date DESC, s.id DESC
-    `);
+    const { rows } = await pool.query(SETTLEMENTS_QUERY);
     res.json(rows);
   } catch (error) {
     console.error(error);
@@ -404,18 +964,7 @@ app.patch("/api/settlements/:id/restore", async (req, res) => {
 // Player alias management
 app.get("/api/players/aliases", async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT p.id, p.name,
-        COALESCE(
-          json_agg(json_build_object('id', pa.id, 'alias', pa.alias))
-          FILTER (WHERE pa.id IS NOT NULL), '[]'
-        ) AS aliases,
-        COALESCE((SELECT SUM(sr.amount) FROM session_results sr WHERE sr.player_id = p.id), 0) AS session_profit
-      FROM players p
-      LEFT JOIN player_aliases pa ON pa.player_id = p.id
-      GROUP BY p.id
-      ORDER BY p.name
-    `);
+    const { rows } = await pool.query(PLAYER_ALIASES_QUERY);
     res.json(rows);
   } catch (error) {
     console.error(error);
@@ -586,7 +1135,119 @@ function generateCode(): string {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const COMMITMENT_TYPES = new Set(["full", "custom", "flexible"]);
+
+type CommitmentType = "full" | "custom" | "flexible";
+
+function buildCommitment(
+  rawType: unknown,
+  plannedEndAt: string | Date | null,
+  rawMinutes: unknown,
+  now = new Date()
+): {
+  type: CommitmentType;
+  startAt: Date | null;
+  endAt: Date | null;
+  lockedAt: Date;
+} {
+  const type = typeof rawType === "string" ? rawType : "flexible";
+  if (!COMMITMENT_TYPES.has(type)) {
+    throw new Error("commitmentType must be full, custom or flexible");
+  }
+  if (type === "flexible") {
+    return { type: "flexible", startAt: null, endAt: null, lockedAt: now };
+  }
+
+  if (type === "full") {
+    const endAt = plannedEndAt ? new Date(plannedEndAt) : null;
+    if (!endAt || !Number.isFinite(endAt.getTime()) || endAt <= now) {
+      throw new Error("The table's planned end has passed; choose a custom or flexible plan");
+    }
+    return { type: "full", startAt: now, endAt, lockedAt: now };
+  }
+
+  const minutes = Number(rawMinutes);
+  if (!Number.isInteger(minutes) || minutes < 60 || minutes > 720) {
+    throw new Error("Custom plans must be between 60 and 720 minutes");
+  }
+  return {
+    type: "custom",
+    startAt: now,
+    endAt: new Date(now.getTime() + minutes * 60_000),
+    lockedAt: now,
+  };
+}
+
+async function getLiveSessionSnapshot(db: any, idOrCode: string) {
+  const sessRes = await db.query(
+    UUID_PATTERN.test(idOrCode)
+      ? "SELECT * FROM live_sessions WHERE id = $1"
+      : "SELECT * FROM live_sessions WHERE UPPER(session_code) = UPPER($1)",
+    [idOrCode]
+  );
+  if (sessRes.rows.length === 0) return null;
+  const session = sessRes.rows[0];
+
+  const [playersRes, buyInsRes, attendanceRes] = await Promise.all([
+    db.query(
+      `SELECT lsp.*, lu.name
+       FROM live_session_players lsp
+       JOIN live_users lu ON lsp.user_id = lu.id
+       WHERE lsp.session_id = $1
+       ORDER BY lsp.joined_at ASC, lsp.id ASC`,
+      [session.id]
+    ),
+    db.query(
+      `SELECT * FROM live_buy_ins
+       WHERE session_id = $1
+       ORDER BY timestamp ASC`,
+      [session.id]
+    ),
+    db.query(
+      `SELECT id, session_id, user_id, event_type, occurred_at
+       FROM live_attendance_events
+       WHERE session_id = $1
+       ORDER BY occurred_at ASC, id ASC`,
+      [session.id]
+    ),
+  ]);
+
+  return {
+    session,
+    players: playersRes.rows,
+    buyIns: buyInsRes.rows,
+    attendanceEvents: attendanceRes.rows,
+  };
+}
+
 // ── Auth ────────────────────────────────────────────────────────────────────
+
+async function issueLiveAuthToken(userId: string): Promise<string> {
+  const token = randomBytes(32).toString("base64url");
+  await pool.query(
+    "UPDATE live_users SET auth_token_hash = $1 WHERE id = $2",
+    [hashAccessToken(token), userId]
+  );
+  return token;
+}
+
+async function authenticateLiveRequest(req: any) {
+  const token = readBearerToken(req);
+  if (!token) return null;
+  const result = await pool.query(
+    "SELECT id, auth_token_hash FROM live_users WHERE auth_token_hash = $1",
+    [hashAccessToken(token)]
+  );
+  if (
+    result.rows.length === 0 ||
+    !accessTokenMatches(token, result.rows[0].auth_token_hash)
+  ) {
+    return null;
+  }
+  return result.rows[0] as { id: string };
+}
 
 app.post("/api/live/auth/register", async (req, res) => {
   const { name, username, password } = req.body;
@@ -599,11 +1260,14 @@ app.post("/api/live/auth/register", async (req, res) => {
     );
     if (dup.rows.length > 0)
       return res.status(409).json({ error: "Username already taken" });
+    const authToken = randomBytes(32).toString("base64url");
     const result = await pool.query(
-      "INSERT INTO live_users (name, username, password) VALUES ($1, $2, $3) RETURNING id, name, username, mobile",
-      [name.trim(), username.trim(), password]
+      `INSERT INTO live_users (name, username, password, auth_token_hash)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, name, username, mobile`,
+      [name.trim(), username.trim(), password, hashAccessToken(authToken)]
     );
-    res.status(201).json({ user: result.rows[0] });
+    res.status(201).json({ user: { ...result.rows[0], authToken } });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Registration failed" });
@@ -621,7 +1285,8 @@ app.post("/api/live/auth/login", async (req, res) => {
     );
     if (result.rows.length === 0)
       return res.status(401).json({ error: "Invalid username or password" });
-    res.json({ user: result.rows[0] });
+    const authToken = await issueLiveAuthToken(result.rows[0].id);
+    res.json({ user: { ...result.rows[0], authToken } });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Login failed" });
@@ -630,61 +1295,167 @@ app.post("/api/live/auth/login", async (req, res) => {
 
 // ── Sessions ────────────────────────────────────────────────────────────────
 
+async function getLiveSessionsForUser(userId?: string) {
+  if (userId) {
+    const result = await pool.query(
+      `SELECT DISTINCT ls.*
+       FROM live_sessions ls
+       LEFT JOIN live_session_players lsp ON ls.id = lsp.session_id
+       WHERE lsp.user_id = $1 OR ls.created_by = $1 OR ls.status = 'active'
+       ORDER BY ls.created_at DESC`,
+      [userId]
+    );
+    return result.rows;
+  }
+  const result = await pool.query(
+    "SELECT * FROM live_sessions ORDER BY created_at DESC"
+  );
+  return result.rows;
+}
+
+async function getLiveUserStats(userId: string) {
+  const statsRes = await pool.query(
+    `SELECT
+      COALESCE(SUM(CASE WHEN ls.created_at >= NOW() - INTERVAL '7 days'
+        THEN (COALESCE(lsp.final_winnings,0) - COALESCE(bi.total_buyin,0)) ELSE 0 END), 0) AS "weeklyPL",
+      COALESCE(SUM(CASE WHEN ls.created_at >= NOW() - INTERVAL '30 days'
+        THEN (COALESCE(lsp.final_winnings,0) - COALESCE(bi.total_buyin,0)) ELSE 0 END), 0) AS "monthlyPL",
+      COALESCE(SUM(CASE WHEN ls.created_at >= NOW() - INTERVAL '365 days'
+        THEN (COALESCE(lsp.final_winnings,0) - COALESCE(bi.total_buyin,0)) ELSE 0 END), 0) AS "yearlyPL",
+      COALESCE(SUM(COALESCE(lsp.final_winnings,0) - COALESCE(bi.total_buyin,0)), 0) AS "totalPL"
+     FROM live_session_players lsp
+     JOIN live_sessions ls ON lsp.session_id = ls.id
+     LEFT JOIN (
+       SELECT session_id, user_id, SUM(amount) AS total_buyin
+       FROM live_buy_ins WHERE status = 'approved'
+       GROUP BY session_id, user_id
+     ) bi ON bi.session_id = lsp.session_id AND bi.user_id = lsp.user_id
+     WHERE lsp.user_id = $1 AND ls.status = 'closed'`,
+    [userId]
+  );
+  const stats = statsRes.rows[0] || {
+    weeklyPL: 0, monthlyPL: 0, yearlyPL: 0, totalPL: 0,
+  };
+
+  const historyRes = await pool.query(
+    `SELECT
+       ls.id           AS session_id,
+       ls.name         AS session_name,
+       ls.created_at   AS session_date,
+       COALESCE(lsp.final_winnings, 0)     AS final_winnings,
+       COALESCE(bi.total_buyin, 0)         AS buyin_amount
+     FROM live_session_players lsp
+     JOIN live_sessions ls ON lsp.session_id = ls.id
+     LEFT JOIN (
+       SELECT session_id, user_id, SUM(amount) AS total_buyin
+       FROM live_buy_ins WHERE status = 'approved'
+       GROUP BY session_id, user_id
+     ) bi ON bi.session_id = lsp.session_id AND bi.user_id = lsp.user_id
+     WHERE lsp.user_id = $1 AND ls.status = 'closed'
+     ORDER BY ls.created_at ASC`,
+    [userId]
+  );
+  const history = historyRes.rows.map((row: any) => ({
+    sessionId: row.session_id,
+    sessionName: row.session_name,
+    date: new Date(row.session_date).getTime(),
+    pl: parseFloat(row.final_winnings) - parseFloat(row.buyin_amount),
+  }));
+  return { ...stats, history };
+}
+
 app.get("/api/live/sessions", async (req, res) => {
   const { userId } = req.query as { userId?: string };
   try {
-    let rows;
-    if (userId) {
-      // Return sessions the user participates in, plus every active table
-      // so the lobby shows joinable games without requiring the 6-char code.
-      const result = await pool.query(
-        `SELECT DISTINCT ls.*
-         FROM live_sessions ls
-         LEFT JOIN live_session_players lsp ON ls.id = lsp.session_id
-         WHERE lsp.user_id = $1 OR ls.created_by = $1 OR ls.status = 'active'
-         ORDER BY ls.created_at DESC`,
-        [userId]
-      );
-      rows = result.rows;
-    } else {
-      const result = await pool.query(
-        "SELECT * FROM live_sessions ORDER BY created_at DESC"
-      );
-      rows = result.rows;
-    }
-    res.json(rows);
+    res.json(await getLiveSessionsForUser(userId));
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Failed to fetch live sessions" });
   }
 });
 
+app.get("/api/live/lobby/:userId", async (req, res) => {
+  const { userId } = req.params;
+  if (!UUID_PATTERN.test(userId)) {
+    return res.status(400).json({ error: "Invalid user id" });
+  }
+  try {
+    const [sessions, stats] = await Promise.all([
+      getLiveSessionsForUser(userId),
+      getLiveUserStats(userId),
+    ]);
+    res.json({ sessions, stats });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to load live lobby" });
+  }
+});
+
 app.post("/api/live/sessions", async (req, res) => {
-  const { name, blindValue, createdBy } = req.body;
+  const {
+    name,
+    blindValue,
+    createdBy,
+    plannedDurationMinutes,
+    hostCommitmentType,
+    hostCommitmentMinutes,
+  } = req.body;
   if (!name || !createdBy)
     return res.status(400).json({ error: "name and createdBy are required" });
+  const durationMinutes = Number(plannedDurationMinutes ?? 240);
+  if (!Number.isInteger(durationMinutes) || durationMinutes < 60 || durationMinutes > 720) {
+    return res.status(400).json({ error: "plannedDurationMinutes must be between 60 and 720" });
+  }
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const code = generateCode();
+    const createdAt = new Date();
+    const plannedEndAt = new Date(createdAt.getTime() + durationMinutes * 60_000);
+    const hostPlan = buildCommitment(
+      hostCommitmentType ?? "full",
+      plannedEndAt,
+      hostCommitmentMinutes,
+      createdAt
+    );
     const sessionRes = await client.query(
-      `INSERT INTO live_sessions (name, session_code, blind_value, created_by)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [name.trim(), code, blindValue || "10/20", createdBy]
+      `INSERT INTO live_sessions
+         (name, session_code, blind_value, created_by, planned_end_at, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [name.trim(), code, blindValue || "10/20", createdBy, plannedEndAt, createdAt]
     );
     const session = sessionRes.rows[0];
-    // Add creator as admin player
     await client.query(
-      `INSERT INTO live_session_players (session_id, user_id, role)
-       VALUES ($1, $2, 'admin')`,
-      [session.id, createdBy]
+      `INSERT INTO live_session_players
+         (session_id, user_id, role, joined_at, commitment_type,
+          commitment_start_at, commitment_end_at, commitment_locked_at)
+       VALUES ($1, $2, 'admin', $3, $4, $5, $6, $7)`,
+      [
+        session.id,
+        createdBy,
+        createdAt,
+        hostPlan.type,
+        hostPlan.startAt,
+        hostPlan.endAt,
+        hostPlan.lockedAt,
+      ]
     );
+    await client.query(
+      `INSERT INTO live_attendance_events
+         (session_id, user_id, event_type, occurred_at)
+       VALUES ($1, $2, 'join', $3)`,
+      [session.id, createdBy, createdAt]
+    );
+    const snapshot = await getLiveSessionSnapshot(client, session.id);
     await client.query("COMMIT");
-    res.status(201).json(session);
+    res.status(201).json(snapshot);
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
-    res.status(500).json({ error: "Failed to create live session" });
+    const message = error instanceof Error ? error.message : "Failed to create live session";
+    res.status(message.includes("commitment") || message.includes("plan") ? 400 : 500).json({
+      error: message,
+    });
   } finally {
     client.release();
   }
@@ -752,7 +1523,7 @@ app.post("/api/live/sessions/:id/publish", async (req, res) => {
       buyIns
     );
 
-    if (!validation.ok) {
+    if (validation.ok === false) {
       await client.query("ROLLBACK");
       const err = validation.error;
       if (err.code === "already_published") {
@@ -802,29 +1573,35 @@ app.post("/api/live/sessions/:id/publish", async (req, res) => {
 
 // Specific session sub-routes MUST come before the /:idOrCode param route
 app.post("/api/live/session/join", async (req, res) => {
-  const { code, userId, role } = req.body;
+  const { code, userId, role, commitmentType, commitmentMinutes } = req.body;
   if (!code || !userId)
     return res.status(400).json({ error: "code and userId are required" });
+  const client = await pool.connect();
   try {
-    const sessRes = await pool.query(
-      "SELECT * FROM live_sessions WHERE UPPER(session_code) = UPPER($1)",
+    await client.query("BEGIN");
+    const sessRes = await client.query(
+      "SELECT * FROM live_sessions WHERE UPPER(session_code) = UPPER($1) FOR UPDATE",
       [code]
     );
-    if (sessRes.rows.length === 0)
+    if (sessRes.rows.length === 0) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ error: "Session code not found" });
+    }
     const session = sessRes.rows[0];
-    if (session.status === "closed")
+    if (session.status === "closed") {
+      await client.query("ROLLBACK");
       return res.status(403).json({ error: "Session is closed" });
+    }
 
-    // Check if already joined
-    const existing = await pool.query(
+    const existing = await client.query(
       "SELECT * FROM live_session_players WHERE session_id = $1 AND user_id = $2",
       [session.id, userId]
     );
     if (existing.rows.length > 0) {
       const player = existing.rows[0];
       if (player.left_at !== null) {
-        const rejoined = await pool.query(
+        const rejoinedAt = new Date();
+        await client.query(
           `UPDATE live_session_players
            SET left_at = NULL, final_winnings = NULL,
                leave_pending = FALSE, pending_out_chips = NULL
@@ -832,32 +1609,113 @@ app.post("/api/live/session/join", async (req, res) => {
            RETURNING *`,
           [session.id, userId]
         );
-        return res.status(200).json({ player: rejoined.rows[0], sessionId: session.id });
+        await client.query(
+          `INSERT INTO live_attendance_events
+             (session_id, user_id, event_type, occurred_at)
+           VALUES ($1, $2, 'rejoin', $3)`,
+          [session.id, userId, rejoinedAt]
+        );
       }
-      return res.status(200).json({ player, sessionId: session.id });
+      const snapshot = await getLiveSessionSnapshot(client, session.id);
+      await client.query("COMMIT");
+      return res.status(200).json(snapshot);
     }
 
     const playerRole = role || "player";
-    const playerRes = await pool.query(
-      `INSERT INTO live_session_players (session_id, user_id, role)
-       VALUES ($1, $2, $3)
-       RETURNING *`,
-      [session.id, userId, playerRole]
+    const joinedAt = new Date();
+    const commitment = buildCommitment(
+      commitmentType,
+      session.planned_end_at,
+      commitmentMinutes,
+      joinedAt
     );
-    res.status(201).json({ player: playerRes.rows[0], sessionId: session.id });
+    await client.query(
+      `INSERT INTO live_session_players
+         (session_id, user_id, role, joined_at, commitment_type,
+          commitment_start_at, commitment_end_at, commitment_locked_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        session.id,
+        userId,
+        playerRole,
+        joinedAt,
+        commitment.type,
+        commitment.startAt,
+        commitment.endAt,
+        commitment.lockedAt,
+      ]
+    );
+    await client.query(
+      `INSERT INTO live_attendance_events
+         (session_id, user_id, event_type, occurred_at)
+       VALUES ($1, $2, 'join', $3)`,
+      [session.id, userId, joinedAt]
+    );
+    const snapshot = await getLiveSessionSnapshot(client, session.id);
+    await client.query("COMMIT");
+    res.status(201).json(snapshot);
   } catch (error) {
+    await client.query("ROLLBACK");
     console.error(error);
-    res.status(500).json({ error: "Failed to join session" });
+    const message = error instanceof Error ? error.message : "Failed to join session";
+    res.status(
+      message.includes("commitment") ||
+        message.includes("plans") ||
+        message.includes("table's planned end")
+        ? 400
+        : 500
+    ).json({ error: message });
+  } finally {
+    client.release();
   }
 });
 
 app.post("/api/live/session/buyin", async (req, res) => {
   const { sessionId, userId, amount, status } = req.body;
-  if (!sessionId || !userId || !amount)
+  if (!sessionId || !userId || amount === undefined)
     return res.status(400).json({ error: "sessionId, userId and amount are required" });
+  if (
+    typeof amount !== "number" ||
+    !Number.isFinite(amount) ||
+    amount <= 0 ||
+    amount > 1_000_000_000
+  ) {
+    return res.status(400).json({ error: "amount must be a finite positive number" });
+  }
+  const buyInStatus = status || "pending";
+  if (buyInStatus !== "pending" && buyInStatus !== "approved") {
+    return res.status(400).json({ error: "Invalid initial buy-in status" });
+  }
+  let actor: { id: string } | null;
+  try {
+    actor = await authenticateLiveRequest(req);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: "Could not authenticate buy-in" });
+  }
+  if (!actor) return res.status(401).json({ error: "Sign in again to add a buy-in" });
+  if (actor.id !== userId) {
+    return res.status(403).json({ error: "Buy-ins can only be requested for yourself" });
+  }
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    const sessionRes = await client.query(
+      "SELECT status, created_by FROM live_sessions WHERE id = $1 FOR UPDATE",
+      [sessionId]
+    );
+    if (sessionRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Session not found" });
+    }
+    if (sessionRes.rows[0].status !== "active") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Session is already closed" });
+    }
+    if (buyInStatus === "approved" && sessionRes.rows[0].created_by !== actor.id) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Only the host can add an approved buy-in" });
+    }
     // Auto-enroll as player if not already in session
     const existing = await client.query(
       "SELECT 1 AS existing FROM live_session_players WHERE session_id = $1 AND user_id = $2",
@@ -865,11 +1723,30 @@ app.post("/api/live/session/buyin", async (req, res) => {
     );
     if (existing.rows.length === 0) {
       await client.query(
-        "INSERT INTO live_session_players (session_id, user_id, role) VALUES ($1, $2, 'player')",
+        `INSERT INTO live_session_players
+           (session_id, user_id, role, joined_at, commitment_type, commitment_locked_at)
+         VALUES ($1, $2, 'player', NOW(), 'flexible', NOW())`,
+        [sessionId, userId]
+      );
+      await client.query(
+        `INSERT INTO live_attendance_events (session_id, user_id, event_type)
+         VALUES ($1, $2, 'join')`,
         [sessionId, userId]
       );
     }
-    const buyInStatus = status || "pending";
+    if (buyInStatus === "pending") {
+      const pending = await client.query(
+        `SELECT 1
+         FROM live_buy_ins
+         WHERE session_id = $1 AND user_id = $2 AND status = 'pending'
+         LIMIT 1`,
+        [sessionId, userId]
+      );
+      if (pending.rows.length > 0) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "A buy-in request is already pending" });
+      }
+    }
     const buyInRes = await client.query(
       `INSERT INTO live_buy_ins (session_id, user_id, amount, status)
        VALUES ($1, $2, $3, $4) RETURNING *`,
@@ -887,28 +1764,13 @@ app.post("/api/live/session/buyin", async (req, res) => {
 });
 
 app.post("/api/live/session/settle", async (req, res) => {
-  const { sessionId, userId, winnings } = req.body;
-  if (!sessionId || !userId || winnings === undefined)
-    return res.status(400).json({ error: "sessionId, userId and winnings are required" });
-  try {
-    const result = await pool.query(
-      `UPDATE live_session_players
-       SET final_winnings = $1
-       WHERE session_id = $2 AND user_id = $3
-       RETURNING *`,
-      [winnings, sessionId, userId]
-    );
-    if (result.rows.length === 0)
-      return res.status(404).json({ error: "Player not found in session" });
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Failed to record winnings" });
-  }
+  res.status(410).json({
+    error: "Final chip counts are recorded through authenticated session finalization",
+  });
 });
 
 app.post("/api/live/session/leave", async (req, res) => {
-  const { sessionId, userId, outChips } = req.body;
+  const { sessionId, userId, outChips, adjustPlan } = req.body;
   if (!sessionId || !userId || outChips === undefined)
     return res.status(400).json({ error: "sessionId, userId and outChips are required" });
   if (typeof outChips !== 'number' || outChips < 0)
@@ -951,10 +1813,11 @@ app.post("/api/live/session/leave", async (req, res) => {
     const result = await client.query(
       `UPDATE live_session_players
        SET leave_pending = TRUE,
-           pending_out_chips = $1
-       WHERE session_id = $2 AND user_id = $3
+           pending_out_chips = $1,
+           pending_plan_adjustment = $2
+       WHERE session_id = $3 AND user_id = $4
        RETURNING *`,
-      [outChips, sessionId, userId]
+      [outChips, adjustPlan === true, sessionId, userId]
     );
 
     await client.query("COMMIT");
@@ -972,23 +1835,52 @@ app.post("/api/live/session/leave/approve", async (req, res) => {
   const { sessionId, userId } = req.body;
   if (!sessionId || !userId)
     return res.status(400).json({ error: "sessionId and userId are required" });
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
+    await client.query("BEGIN");
+    const sessionRes = await client.query(
+      "SELECT status FROM live_sessions WHERE id = $1 FOR UPDATE",
+      [sessionId]
+    );
+    if (sessionRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Session not found" });
+    }
+    if (sessionRes.rows[0].status !== "active") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Session is already closed" });
+    }
+    const leftAt = new Date();
+    const result = await client.query(
       `UPDATE live_session_players
        SET final_winnings = pending_out_chips,
-           left_at = NOW(),
+           left_at = $1,
            leave_pending = FALSE,
-           pending_out_chips = NULL
-       WHERE session_id = $1 AND user_id = $2 AND leave_pending = TRUE
+           pending_out_chips = NULL,
+           commitment_adjusted = commitment_adjusted OR pending_plan_adjustment,
+           pending_plan_adjustment = FALSE
+       WHERE session_id = $2 AND user_id = $3 AND leave_pending = TRUE
        RETURNING *`,
-      [sessionId, userId]
+      [leftAt, sessionId, userId]
     );
-    if (result.rows.length === 0)
+    if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ error: "No pending leave request found" });
+    }
+    await client.query(
+      `INSERT INTO live_attendance_events
+        (session_id, user_id, event_type, occurred_at)
+       VALUES ($1, $2, 'leave', $3)`,
+      [sessionId, userId, leftAt]
+    );
+    await client.query("COMMIT");
     res.json({ player: result.rows[0] });
   } catch (error) {
+    await client.query("ROLLBACK");
     console.error(error);
     res.status(500).json({ error: "Failed to approve leave request" });
+  } finally {
+    client.release();
   }
 });
 
@@ -1000,8 +1892,13 @@ app.post("/api/live/session/leave/reject", async (req, res) => {
     const result = await pool.query(
       `UPDATE live_session_players
        SET leave_pending = FALSE,
-           pending_out_chips = NULL
+           pending_out_chips = NULL,
+           pending_plan_adjustment = FALSE
        WHERE session_id = $1 AND user_id = $2
+         AND EXISTS (
+           SELECT 1 FROM live_sessions
+           WHERE id = $1 AND status = 'active'
+         )
        RETURNING *`,
       [sessionId, userId]
     );
@@ -1014,59 +1911,210 @@ app.post("/api/live/session/leave/reject", async (req, res) => {
   }
 });
 
-app.post("/api/live/session/status", async (req, res) => {
-  const { sessionId, status } = req.body;
-  if (!sessionId || !status)
-    return res.status(400).json({ error: "sessionId and status are required" });
+app.post("/api/live/session/finalize", async (req, res) => {
+  const { sessionId, results, endReason } = req.body;
+  const allowedEndReasons = new Set(["completed", "table_break", "ended_early"]);
+  if (!sessionId || !UUID_PATTERN.test(sessionId)) {
+    return res.status(400).json({ error: "A valid sessionId is required" });
+  }
+  let actor: { id: string } | null;
   try {
-    const result = await pool.query(
-      `UPDATE live_sessions
-       SET status = $1,
-           closed_at = CASE WHEN $1 = 'closed' THEN NOW() ELSE closed_at END
-       WHERE id = $2
-       RETURNING *`,
-      [status, sessionId]
-    );
-    if (result.rows.length === 0)
-      return res.status(404).json({ error: "Session not found" });
-    res.json(result.rows[0]);
+    actor = await authenticateLiveRequest(req);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Failed to update session status" });
+    return res.status(500).json({ error: "Could not authenticate finalization" });
   }
+  if (!actor) {
+    return res.status(401).json({ error: "Sign in again before finalizing" });
+  }
+  if (!Array.isArray(results) || results.length === 0 || results.length > 100) {
+    return res.status(400).json({ error: "results must contain every player" });
+  }
+  if (!allowedEndReasons.has(endReason)) {
+    return res.status(400).json({ error: "Invalid endReason" });
+  }
+
+  const normalized = results.map((result: any) => ({
+    userId: typeof result?.userId === "string" ? result.userId : "",
+    winnings: Number(result?.winnings),
+  }));
+  if (
+    normalized.some(
+      (result) =>
+        !UUID_PATTERN.test(result.userId) ||
+        !Number.isFinite(result.winnings) ||
+        result.winnings < 0
+    )
+  ) {
+    return res.status(400).json({ error: "Each result needs a valid player and chip count" });
+  }
+  if (new Set(normalized.map((result) => result.userId)).size !== normalized.length) {
+    return res.status(400).json({ error: "Duplicate players are not allowed" });
+  }
+  const rawAttendanceEvents = req.body.attendanceEvents ?? [];
+  if (!Array.isArray(rawAttendanceEvents) || rawAttendanceEvents.length > 500) {
+    return res.status(400).json({ error: "attendanceEvents must contain at most 500 events" });
+  }
+  const attendanceEvents = rawAttendanceEvents.map((event: any) => ({
+    id: typeof event?.id === "string" ? event.id : "",
+    userId: typeof event?.userId === "string" ? event.userId : "",
+    eventType: event?.eventType,
+    occurredAt: new Date(event?.occurredAt),
+  }));
+  if (
+    attendanceEvents.some(
+      (event) =>
+        !UUID_PATTERN.test(event.id) ||
+        !UUID_PATTERN.test(event.userId) ||
+        (event.eventType !== "pause" && event.eventType !== "resume") ||
+        !Number.isFinite(event.occurredAt.getTime())
+    )
+  ) {
+    return res.status(400).json({ error: "Invalid attendance event" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const sessionRes = await client.query(
+      `SELECT id, status, created_at, created_by
+       FROM live_sessions
+       WHERE id = $1
+       FOR UPDATE`,
+      [sessionId]
+    );
+    if (sessionRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Session not found" });
+    }
+    if (sessionRes.rows[0].created_by !== actor.id) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Only the session host can finalize" });
+    }
+    if (sessionRes.rows[0].status === "closed") {
+      const snapshot = await getLiveSessionSnapshot(client, sessionId);
+      await client.query("COMMIT");
+      return res.json(snapshot);
+    }
+
+    const playersRes = await client.query(
+      "SELECT user_id FROM live_session_players WHERE session_id = $1",
+      [sessionId]
+    );
+    const playerIds = new Set(playersRes.rows.map((row: any) => row.user_id));
+    if (
+      playerIds.size !== normalized.length ||
+      normalized.some((result) => !playerIds.has(result.userId))
+    ) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Final chip counts must include every player once" });
+    }
+    const sessionStartedAt = new Date(sessionRes.rows[0].created_at).getTime();
+    const latestAllowedAt = Date.now() + 5 * 60_000;
+    if (
+      attendanceEvents.some(
+        (event) =>
+          !playerIds.has(event.userId) ||
+          event.occurredAt.getTime() < sessionStartedAt ||
+          event.occurredAt.getTime() > latestAllowedAt
+      )
+    ) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Attendance events fall outside this session" });
+    }
+
+    const poolRes = await client.query(
+      `SELECT
+         COALESCE(SUM(amount) FILTER (WHERE status = 'approved'), 0)::numeric AS total,
+         COUNT(*) FILTER (WHERE status = 'pending')::integer AS pending_count
+       FROM live_buy_ins
+       WHERE session_id = $1`,
+      [sessionId]
+    );
+    if (Number(poolRes.rows[0].pending_count) > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "Approve or reject every pending buy-in before finalizing",
+      });
+    }
+    const totalBuyIns = Number(poolRes.rows[0].total);
+    if (!Number.isFinite(totalBuyIns)) {
+      await client.query("ROLLBACK");
+      return res.status(422).json({ error: "Approved buy-ins contain an invalid amount" });
+    }
+    const totalWinnings = normalized.reduce((sum, result) => sum + result.winnings, 0);
+    if (Math.abs(totalWinnings - totalBuyIns) > 0.1) {
+      await client.query("ROLLBACK");
+      return res.status(422).json({
+        error: `Chips out (${totalWinnings}) must equal approved buy-ins (${totalBuyIns})`,
+      });
+    }
+
+    await client.query(
+      `UPDATE live_session_players AS player
+       SET final_winnings = input.winnings
+       FROM jsonb_to_recordset($1::jsonb)
+         AS input("userId" UUID, winnings NUMERIC)
+       WHERE player.session_id = $2
+         AND player.user_id = input."userId"`,
+      [JSON.stringify(normalized), sessionId]
+    );
+    if (attendanceEvents.length > 0) {
+      await client.query(
+        `INSERT INTO live_attendance_events
+           (id, session_id, user_id, event_type, occurred_at)
+         SELECT input.id, $2, input."userId", input."eventType", input."occurredAt"
+         FROM jsonb_to_recordset($1::jsonb)
+           AS input(
+             id UUID,
+             "userId" UUID,
+             "eventType" TEXT,
+             "occurredAt" TIMESTAMPTZ
+           )
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          JSON.stringify(
+            attendanceEvents.map((event) => ({
+              ...event,
+              occurredAt: event.occurredAt.toISOString(),
+            }))
+          ),
+          sessionId,
+        ]
+      );
+    }
+    await client.query(
+      `UPDATE live_sessions
+       SET status = 'closed', closed_at = NOW(), end_reason = $1
+       WHERE id = $2`,
+      [endReason, sessionId]
+    );
+    const snapshot = await getLiveSessionSnapshot(client, sessionId);
+    await client.query("COMMIT");
+    res.json(snapshot);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    res.status(500).json({ error: "Failed to finalize session" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/live/session/status", async (req, res) => {
+  res.status(410).json({
+    error: "Use authenticated session finalization to close a session",
+  });
 });
 
 // Parameterized session route — after specific sub-routes
 app.get("/api/live/session/:idOrCode", async (req, res) => {
   const { idOrCode } = req.params;
-  const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(idOrCode);
   try {
-    const sessRes = await pool.query(
-      isUUID
-        ? "SELECT * FROM live_sessions WHERE id = $1"
-        : "SELECT * FROM live_sessions WHERE UPPER(session_code) = UPPER($1)",
-      [idOrCode]
-    );
-    if (sessRes.rows.length === 0)
+    const snapshot = await getLiveSessionSnapshot(pool, idOrCode);
+    if (!snapshot)
       return res.status(404).json({ error: "Session not found" });
-    const session = sessRes.rows[0];
-
-    const playersRes = await pool.query(
-      `SELECT lsp.*, lu.name
-       FROM live_session_players lsp
-       JOIN live_users lu ON lsp.user_id = lu.id
-       WHERE lsp.session_id = $1`,
-      [session.id]
-    );
-
-    const buyInsRes = await pool.query(
-      `SELECT * FROM live_buy_ins
-       WHERE session_id = $1
-       ORDER BY timestamp ASC`,
-      [session.id]
-    );
-
-    res.json({ session, players: playersRes.rows, buyIns: buyInsRes.rows });
+    res.json(snapshot);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Failed to fetch session" });
@@ -1076,19 +2124,53 @@ app.get("/api/live/session/:idOrCode", async (req, res) => {
 // Buy-in status update
 app.patch("/api/live/buyin/:id", async (req, res) => {
   const { status } = req.body;
-  if (!status)
-    return res.status(400).json({ error: "status is required" });
+  if (!["approved", "rejected"].includes(status))
+    return res.status(400).json({ error: "A valid status is required" });
+  let actor: { id: string } | null;
   try {
-    const result = await pool.query(
+    actor = await authenticateLiveRequest(req);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: "Could not authenticate buy-in update" });
+  }
+  if (!actor) return res.status(401).json({ error: "Sign in again to update buy-ins" });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const buyIn = await client.query(
+      `SELECT buy_in.session_id, live_session.status, live_session.created_by
+       FROM live_buy_ins AS buy_in
+       JOIN live_sessions AS live_session ON live_session.id = buy_in.session_id
+       WHERE buy_in.id = $1
+       FOR UPDATE OF live_session`,
+      [req.params.id]
+    );
+    if (buyIn.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Buy-in not found" });
+    }
+    if (buyIn.rows[0].status !== "active") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Session is already closed" });
+    }
+    if (buyIn.rows[0].created_by !== actor.id) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Only the session host can update buy-ins" });
+    }
+    const result = await client.query(
       "UPDATE live_buy_ins SET status = $1 WHERE id = $2 RETURNING *",
       [status, req.params.id]
     );
+    await client.query("COMMIT");
     if (result.rows.length === 0)
       return res.status(404).json({ error: "Buy-in not found" });
     res.json(result.rows[0]);
   } catch (error) {
+    await client.query("ROLLBACK");
     console.error(error);
     res.status(500).json({ error: "Failed to update buy-in" });
+  } finally {
+    client.release();
   }
 });
 
@@ -1096,55 +2178,7 @@ app.patch("/api/live/buyin/:id", async (req, res) => {
 app.get("/api/live/stats/:userId", async (req, res) => {
   const { userId } = req.params;
   try {
-    const statsRes = await pool.query(
-      `SELECT
-        COALESCE(SUM(CASE WHEN ls.created_at >= NOW() - INTERVAL '7 days'
-          THEN (COALESCE(lsp.final_winnings,0) - COALESCE(bi.total_buyin,0)) ELSE 0 END), 0) AS "weeklyPL",
-        COALESCE(SUM(CASE WHEN ls.created_at >= NOW() - INTERVAL '30 days'
-          THEN (COALESCE(lsp.final_winnings,0) - COALESCE(bi.total_buyin,0)) ELSE 0 END), 0) AS "monthlyPL",
-        COALESCE(SUM(CASE WHEN ls.created_at >= NOW() - INTERVAL '365 days'
-          THEN (COALESCE(lsp.final_winnings,0) - COALESCE(bi.total_buyin,0)) ELSE 0 END), 0) AS "yearlyPL",
-        COALESCE(SUM(COALESCE(lsp.final_winnings,0) - COALESCE(bi.total_buyin,0)), 0) AS "totalPL"
-       FROM live_session_players lsp
-       JOIN live_sessions ls ON lsp.session_id = ls.id
-       LEFT JOIN (
-         SELECT session_id, user_id, SUM(amount) AS total_buyin
-         FROM live_buy_ins WHERE status = 'approved'
-         GROUP BY session_id, user_id
-       ) bi ON bi.session_id = lsp.session_id AND bi.user_id = lsp.user_id
-       WHERE lsp.user_id = $1 AND ls.status = 'closed'`,
-      [userId]
-    );
-    const stats = statsRes.rows[0] || {
-      weeklyPL: 0, monthlyPL: 0, yearlyPL: 0, totalPL: 0,
-    };
-
-    const historyRes = await pool.query(
-      `SELECT
-         ls.id           AS session_id,
-         ls.name         AS session_name,
-         ls.created_at   AS session_date,
-         COALESCE(lsp.final_winnings, 0)     AS final_winnings,
-         COALESCE(bi.total_buyin, 0)         AS buyin_amount
-       FROM live_session_players lsp
-       JOIN live_sessions ls ON lsp.session_id = ls.id
-       LEFT JOIN (
-         SELECT session_id, user_id, SUM(amount) AS total_buyin
-         FROM live_buy_ins WHERE status = 'approved'
-         GROUP BY session_id, user_id
-       ) bi ON bi.session_id = lsp.session_id AND bi.user_id = lsp.user_id
-       WHERE lsp.user_id = $1 AND ls.status = 'closed'
-       ORDER BY ls.created_at ASC`,
-      [userId]
-    );
-    const history = historyRes.rows.map((r: any) => ({
-      sessionId: r.session_id,
-      sessionName: r.session_name,
-      date: new Date(r.session_date).getTime(),
-      pl: parseFloat(r.final_winnings) - parseFloat(r.buyin_amount),
-    }));
-
-    res.json({ ...stats, history });
+    res.json(await getLiveUserStats(userId));
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Failed to fetch stats" });
